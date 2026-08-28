@@ -1,0 +1,81 @@
+parameterValues:
+  - name: Instruction
+    value: pick up the vial and place it in the rack
+  - name: Episodes
+    value: 50
+  - name: MaxAttemptFactor
+    value: 6
+  - name: Randomize
+    value: "true"
+  - name: Fps
+    value: 30
+  - name: EpisodeLengthSeconds
+    value: 15.0
+  - name: Seed
+    value: 101
+  - name: DatasetRepoId
+    value: local/so101_isaac_vials
+
+  # Run ProbeOnly=true FIRST on a new fleet. It prints the joint limits, home
+  # pose, end-effector frame pose, body positions, vial / rack / slot poses and
+  # a Jacobian self-test -- which is where the four calibration values below
+  # come from. Uncalibrated, Datagen discards every attempt and fails the task
+  # rather than writing a bad dataset.
+  - name: ProbeOnly
+    value: "false"
+  # Measured off the SO-ARM101 collision meshes: the pinch centre between the
+  # fingertips is ~75 mm from the ee_frame. NOT the ~5 mm you get if you read the
+  # `jaw` body position ProbeOnly prints -- that is the jaw hinge.
+  - name: GraspZOffset
+    value: 0.075
+  # Same correction, applied to the rack slot target. Placing needs it as much as
+  # grasping does.
+  - name: PlaceZOffset
+    value: 0.075
+  - name: GripperPitchOffset
+    value: 0.0
+  - name: ReorientOffset
+    value: 1.5708
+  - name: JawOpen
+    value: 0.6
+  - name: JawClosed
+    value: -0.1
+
+  - name: TrainSteps
+    value: 20000
+  - name: TrainBatchSize
+    value: 8
+  - name: ActNActionSteps
+    value: 20
+
+  - name: RenderEpisodes
+    value: 3
+  - name: RenderCamera
+    value: external_D455
+
+  # No working default is possible: the built image contains Omniverse Kit and
+  # must not be redistributed. Build it from
+  # containers/isaacsim-so101-workshop/, push it to a private registry you
+  # control, and put that URI here (then set EcrLogin=true for Amazon ECR).
+  - name: ContainerImage
+    value: isaacsim-so101-workshop:2.3.2
+  - name: EcrLogin
+    value: "false"
+  - name: ShaderCacheDir
+    # A fleet persistent volume, so the shader cache survives worker
+    # replacement. Measured effect on a warm volume: Kit boot 347s -> 35s
+    # (9.9x), Datagen end-to-end 11m45s -> 1m07s. Safe on fleets without a
+    # persistent volume: the step warns and falls back to /tmp.
+    value: /mnt/deadline-persistent/isaacsim-so101-cache
+  - name: StepTimeoutSeconds
+    value: 5400
+
+  # Intentionally empty: the container carries the whole Python runtime, so a
+  # Conda queue environment has nothing to solve.
+  - name: CondaPackages
+    value: ""
+  - name: CondaChannels
+    value: deadline-cloud
+
+  - name: OutputDir
+    value: output

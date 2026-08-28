@@ -1,0 +1,1379 @@
+specificationVersion: jobtemplate-2023-09
+name: Isaac Sim SO-101 Sim-to-Policy (5-step)
+description: |
+  The NVIDIA Sim-to-Real-SO-101-Workshop vials-into-rack task as FIVE dependent
+  Deadline Cloud steps:
+    Datagen -> Train -> { Render , Evaluate (xN) -> Aggregate }
+  Steps share a single OutputDir (job attachment): Datagen writes dataset/,
+  Train reads it and writes checkpoint/, Render reads checkpoint/ and writes the
+  MP4 + PNG + render_summary.json. Independently re-runnable, e.g. re-render
+  without re-training.
+
+  Evaluate is the parallel step, and it parallelizes on TWO composed axes:
+  EvalNumEnvs environments vectorized inside each shard's process, times
+  EvalShards shards fanned out over a parameterSpace onto separate workers. Each
+  shard scores the SAME checkpoint on its own seed and domain-randomization
+  condition and writes eval/shard_NN.json; Aggregate reduces those into one
+  eval_summary.json plus a table in its task log. Nothing is shared between
+  shards and no shard reads another's output. Render and the Evaluate fan-out
+  both depend only on Train, so they become READY together.
+
+  The in-process axis is the larger one: NVIDIA's published Isaac Lab-Arena eval
+  speedup is 40x (4096 envs on 8 GPUs), whereas fan-out over single-env shards
+  measured 5x here. Vectorize the rollouts, distribute the sweep -- and the sweep
+  axis that genuinely cannot be vectorized is the condition, not the seed.
+
+  All three steps run inside ONE container image (Isaac Lab 2.3.2 / Isaac Sim
+  5.1.0 + LeRobot at the workshop's pin), which you build from
+  containers/isaacsim-so101-workshop/ and push to a registry you control. One
+  image means the LeRobot that writes the dataset, the LeRobot that trains on
+  it, and the LeRobot that loads the checkpoint are byte-identical -- the
+  config-schema drift that breaks cross-version checkpoint loading cannot occur.
+
+  First run should be Train + Render against a dataset you already have (e.g.
+  one of the workshop's published teleop datasets placed at OutputDir/dataset).
+  That exercises two of three steps with no dependence on the scripted expert's
+  geometric calibration. See README.md.
+
+parameterDefinitions:
+
+# ---------------------------------------------------------------- task -------
+- name: Instruction
+  type: STRING
+  default: pick up the vial and place it in the rack
+  description: >-
+    Recorded as the language annotation on every dataset frame, used to
+    condition the policy during training, and passed to the policy again at
+    render time. Must be identical across all three steps, which is why it is
+    one job parameter rather than three.
+  userInterface:
+    control: LINE_EDIT
+    label: Instruction
+    groupLabel: Task
+- name: Episodes
+  type: INT
+  default: 50
+  minValue: 1
+  maxValue: 2000
+  description: Target count of VERIFIED episodes in the dataset.
+  userInterface:
+    control: SPIN_BOX
+    label: Episodes
+    groupLabel: Task
+- name: MaxAttemptFactor
+  type: INT
+  default: 6
+  minValue: 1
+  maxValue: 50
+  description: >-
+    Datagen gives up after Episodes x this many attempts. Higher than the MuJoCo
+    sample's effective 4 because standing a lying vial upright in a rack slot is
+    a harder scripted target than a cube lift, so more attempts are discarded.
+  userInterface:
+    control: SPIN_BOX
+    label: Max Attempt Factor
+    groupLabel: Task
+- name: Randomize
+  type: STRING
+  default: 'true'
+  allowedValues:
+  - 'true'
+  - 'false'
+  description: >-
+    Selects the -DR-Eval task variant for Datagen, which layers on the
+    workshop's five randomization terms (robot colour, HDRI sky light, mat
+    rotation, camera focal length, camera pose). Render always uses the
+    non-randomized variant so the video shows the policy rather than the
+    randomizer.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Domain Randomize
+    groupLabel: Task
+- name: Fps
+  type: INT
+  default: 30
+  minValue: 1
+  maxValue: 60
+  description: >-
+    Dataset and video frame rate. One env.step() advances sim.dt * decimation =
+    1/60 s, so the scripts push a frame every other step to make this rate true
+    rather than nominal.
+  userInterface:
+    control: SPIN_BOX
+    label: FPS
+    groupLabel: Task
+- name: EpisodeLengthSeconds
+  type: FLOAT
+  default: 15.0
+  minValue: 1.0
+  maxValue: 120.0
+  description: >-
+    Overrides the env cfg. The workshop's -Eval variants ship 7.5 s, which is
+    too short for reach + grasp + reorient + insert + the success term's
+    25-frame confirmation window.
+  userInterface:
+    control: SPIN_BOX
+    label: Episode Length (s)
+    groupLabel: Task
+- name: Seed
+  type: INT
+  default: 101
+  minValue: 0
+  maxValue: 2147483647
+  userInterface:
+    control: SPIN_BOX
+    label: Seed
+    groupLabel: Task
+- name: DatasetRepoId
+  type: STRING
+  default: local/so101_isaac_vials
+  description: LeRobot repo id recorded in the dataset metadata.
+  userInterface:
+    control: LINE_EDIT
+    label: Dataset Repo ID
+    groupLabel: Task
+- name: PolicyCameraRenameMap
+  type: STRING
+  default: ''
+  description: >-
+    Optional JSON mapping this sim's camera names to the camera names the
+    checkpoint was trained with, for driving a policy trained elsewhere. Empty
+    (default) means no renaming, which is correct whenever Datagen produced the
+    dataset -- the keys already match.
+    Needed when DatasetSource=huggingface-hub, because public SO-101 datasets use
+    different camera keys. Without it LeRobot aborts at policy load with
+    "Feature mismatch between dataset/environment and policy config", listing the
+    missing and extra feature names.
+    Example for lerobot/svla_so101_pickplace (cameras up + side):
+    {"ego": "up", "external_D455": "side"}
+    Use bare sim camera names as keys, not full observation.images.* paths. The
+    map is indexed directly per camera, so it must cover EVERY camera in use or
+    the render fails with a KeyError.
+  userInterface:
+    control: LINE_EDIT
+    label: Policy Camera Rename Map (JSON)
+    groupLabel: Container
+- name: DatasetSource
+  type: STRING
+  default: job-attachment
+  allowedValues:
+  - job-attachment
+  - huggingface-hub
+  description: >-
+    Where the Train step reads its dataset from. 'job-attachment' (default) uses
+    OutputDir/dataset, i.e. whatever Datagen produced or you staged there.
+    'huggingface-hub' ignores OutputDir/dataset and lets LeRobot resolve
+    DatasetRepoId from the Hub instead, which lets you exercise Train against a
+    published dataset without generating one first, and avoids pushing
+    gigabytes of video through job attachments. Requires the worker to have
+    outbound access to huggingface.co.
+    Caveat: a checkpoint is tied to the camera keys it trained on. Public SO-101
+    datasets use keys like observation.images.up / .side, whereas this sim
+    produces ego / external_D455 -- so a Hub-trained checkpoint will not drive
+    the Render step without remapping. Use this to validate Train, not the full
+    sim-to-policy loop.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Dataset Source
+    groupLabel: Task
+
+# ------------------------------------------------- scripted expert -----------
+- name: ProbeOnly
+  type: STRING
+  default: 'false'
+  allowedValues:
+  - 'true'
+  - 'false'
+  description: >-
+    Run Datagen in --probe mode: boot the env, reset once, print joint names and
+    limits, the home pose, the end-effector frame pose, every body position, the
+    vial / rack / slot poses, and a Jacobian self-test, then exit without
+    recording. RUN THIS FIRST on a new fleet -- it is where the calibration
+    values below come from.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Probe Only (no recording)
+    groupLabel: Scripted Expert
+- name: GraspZOffset
+  type: FLOAT
+  default: 0.075
+  minValue: -0.2
+  maxValue: 0.2
+  description: >-
+    Metres between the gripper body origin (which is the end-effector frame) and
+    the PINCH CENTRE BETWEEN THE FINGERTIPS. The default is measured off the
+    collision meshes in SO-ARM101-USD.usd: both fingers run out to gripper-local
+    z=-0.105 and their faces sit ~33 mm apart over z in [-0.05, -0.105], so the
+    pinch is ~75 mm from the ee_frame.
+    DO NOT read this off the `jaw` body position that ProbeOnly prints. That
+    body's origin is the jaw HINGE, only ~5 mm below the ee_frame, and taking it
+    for the pinch gives a value 15x too small and a grasp that closes on air.
+  userInterface:
+    control: SPIN_BOX
+    label: Grasp Z Offset (m)
+    groupLabel: Scripted Expert
+- name: PlaceZOffset
+  type: FLOAT
+  default: 0.075
+  minValue: -0.2
+  maxValue: 0.2
+  description: >-
+    Metres between the gripper body origin and the pinch point, applied to the
+    RACK SLOT target during traverse and insert. Normally the same value as
+    Grasp Z Offset, because the ee_frame -> pinch offset applies just as much
+    when placing as when grasping.
+    This exists because the two were originally asymmetric: the grasp target had
+    the correction and the slot target did not, which drove the vial 48 mm into
+    the solid top of the rack (rack top world z=0.133, slot marker 0.16, pinch
+    75 mm below the ee_frame) and put the fingertips at z=0.055, so `insert`
+    stalled against the geometry instead of arriving.
+  userInterface:
+    control: SPIN_BOX
+    label: Place Z Offset (m)
+    groupLabel: Scripted Expert
+- name: GripperPitchOffset
+  type: FLOAT
+  default: 0.0
+  minValue: -3.15
+  maxValue: 3.15
+  description: >-
+    Radians added to the home gripper pitch so the jaw points at the mat. The
+    expert holds (Pitch + Elbow + Wrist_Pitch) constant, which holds gripper
+    pitch constant without needing to know link lengths, so this single scalar
+    is the whole orientation calibration for the grasp.
+  userInterface:
+    control: SPIN_BOX
+    label: Gripper Pitch Offset (rad)
+    groupLabel: Scripted Expert
+- name: ReorientOffset
+  type: FLOAT
+  default: 1.5708
+  minValue: -3.15
+  maxValue: 3.15
+  description: >-
+    Gripper pitch change applied during transfer to stand a lying vial upright.
+    The vials spawn horizontal but the success term requires abs(vial up z) >
+    0.7, i.e. vertical, so this rotation is what makes the task solvable. The
+    sign depends on the gripper's frame convention; ProbeOnly prints the
+    quaternion so you can pick it.
+  userInterface:
+    control: SPIN_BOX
+    label: Reorient Offset (rad)
+    groupLabel: Scripted Expert
+- name: JawOpen
+  type: FLOAT
+  default: 0.6
+  minValue: -1.0
+  maxValue: 2.0
+  userInterface:
+    control: SPIN_BOX
+    label: Jaw Open (rad)
+    groupLabel: Scripted Expert
+- name: JawClosed
+  type: FLOAT
+  default: -0.1
+  minValue: -1.0
+  maxValue: 2.0
+  userInterface:
+    control: SPIN_BOX
+    label: Jaw Closed (rad)
+    groupLabel: Scripted Expert
+- name: HoverHeight
+  type: FLOAT
+  default: 0.09
+  minValue: 0.0
+  maxValue: 0.3
+  description: >-
+    Metres above the grasp point for the pre-grasp hover.
+    Bounded from above by something not obvious: gripper elevation is exactly
+    -(Pitch + Elbow + Wrist_Pitch) radians and Wrist_Pitch is limited to
+    +/-1.65806, so holding the gripper pointing straight DOWN costs reach. With
+    the gripper vertical over a vial at (0.23,-0.08) the highest pinch the joint
+    limits allow is world z=0.1407, so a hover more than ~48 mm above a grasp at
+    z=0.093 is simply unreachable and the servo burns its whole step budget
+    getting nowhere. Lower this before raising ServoMaxSteps.
+  userInterface:
+    control: SPIN_BOX
+    label: Hover Height (m)
+    groupLabel: Scripted Expert
+- name: LiftHeight
+  type: FLOAT
+  default: 0.14
+  minValue: 0.0
+  maxValue: 0.3
+  description: >-
+    Metres above the grasp point to lift to after closing the jaw. Same
+    reachability ceiling as Hover Height.
+  userInterface:
+    control: SPIN_BOX
+    label: Lift Height (m)
+    groupLabel: Scripted Expert
+
+# ------------------------------------------------------- scene / diagnostics --
+- name: VialSpawn
+  type: STRING
+  default: lying
+  allowedValues:
+  - lying
+  - capdown
+  description: >-
+    Attitude the vials spawn in. Applied by mutating the parsed env cfg in
+    process, before gym.make -- NOT by editing the task config, which lives
+    inside a 28.9 GB container image and would cost a rebuild and push per
+    experiment.
+    'lying' (default) is the shipped behaviour: rot = euler(0,90,0), horizontal
+    on the mat.
+    'capdown' stands each vial on the flat face of its cap, which is its only
+    stable upright pose -- the other end is a rounded dome tapering to a ~4 mm
+    tip and cannot balance a 116.5 mm body. Choosing this also moves the spawn
+    HEIGHT, because the shipped fixed_vial_z of 0.05 is the resting root height
+    of a LYING vial; standing cap-down the root is 99.7 mm above the contact
+    face, so 0.05 would spawn the vial ~50 mm inside the mat and physics would
+    fling it.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Vial Spawn Attitude
+    groupLabel: Scripted Expert
+- name: CapDownSpawnZ
+  type: FLOAT
+  default: 0.136
+  minValue: 0.0
+  maxValue: 0.5
+  description: >-
+    Root height (m) used when VialSpawn=capdown. A resting cap-down vial has its
+    root at mat 0.033 + 0.0997 = 0.1327, so the default drops it under 1 mm.
+  userInterface:
+    control: SPIN_BOX
+    label: Cap-Down Spawn Z (m)
+    groupLabel: Scripted Expert
+- name: DeterministicScene
+  type: STRING
+  default: 'false'
+  allowedValues:
+  - 'true'
+  - 'false'
+  description: >-
+    Zero the reset event's vial and rack pose ranges and disable the 0.33 chance
+    of pre-placing a vial in a rack bore. Use it when the point of a run is to
+    demonstrate a geometric property rather than to measure robustness to
+    placement: it makes the scene byte-identical run to run, so an offline
+    kinematic prediction can be compared against the sim without placement noise
+    in between.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Deterministic Scene
+    groupLabel: Scripted Expert
+- name: WaypointPlan
+  type: STRING
+  default: reorient
+  allowedValues:
+  - reorient
+  - flip
+  description: >-
+    Which scripted routine Datagen runs.
+    'reorient' (default) is the shipped plan: grasp a lying vial, lift, rotate
+    the gripper to stand it up, insert into a bore.
+    'flip' grasps an already-STANDING cap-down vial from directly above, rotates
+    ~180 deg about the wrist-pitch axis so the dome faces down, moves over an
+    empty bore and tries to lower it in. Intended to be run with
+    VialSpawn=capdown. Its stages are NON-FATAL: the plan continues past a stage
+    that misses its tolerance, because the stage that fails is the one worth
+    filming and aborting on it leaves the arm frozen before the interesting
+    geometry is reached.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Waypoint Plan
+    groupLabel: Scripted Expert
+- name: FlipPreset
+  type: STRING
+  default: ''
+  description: >-
+    Comma-separated Rotation,Pitch,Elbow the arm ramps to before the grasp, as a
+    starting branch for the position servo. Empty (default) skips it. Only used
+    by WaypointPlan=flip.
+    This exists because the position servo optimises POSITION ONLY, so when two
+    joint solutions reach the same point it has no preference between them -- and
+    on this arm the two branches differ in whether Wrist_Pitch is saturated, i.e.
+    in the gripper's ATTITUDE. Pointing the gripper straight down needs
+    Pitch+Elbow+Wrist_Pitch = +1.5708 with Wrist_Pitch <= 1.65806, hence
+    Pitch+Elbow >= -0.087; at the home pose Pitch+Elbow = -0.685, so Wrist_Pitch
+    saturates and the gripper sits at -55.7 deg no matter how large
+    GripperPitchOffset is. Presetting the arm onto the correct side of that limit
+    is what makes a top-down grasp reachable at all.
+  userInterface:
+    control: LINE_EDIT
+    label: Flip Preset (Rotation,Pitch,Elbow)
+    groupLabel: Scripted Expert
+- name: FlipHoldSteps
+  type: INT
+  default: 60
+  minValue: 0
+  maxValue: 600
+  description: >-
+    Control steps the flip plan keeps pressing at the final insert target after
+    the servo has stopped making progress. This is what leaves the obstruction on
+    screen long enough to see instead of for a single ambiguous frame.
+  userInterface:
+    control: SPIN_BOX
+    label: Flip Hold Steps
+    groupLabel: Scripted Expert
+- name: DebugVideo
+  type: STRING
+  default: 'false'
+  allowedValues:
+  - 'true'
+  - 'false'
+  description: >-
+    Record an MP4 of EVERY Datagen attempt, including the discarded ones, to
+    OutputDir/datagen_debug.mp4.
+    Datagen's integrity model is to throw failed attempts away -- which also
+    throws away the only footage that could explain why they failed, since the
+    recorder's CANCEL event deletes its own videos too. Until this existed the
+    sole diagnostic for a failed run was one line per attempt ("discard attempt 1
+    (70 frames): hover did not complete"), with no way to tell whether the
+    gripper was in the wrong place, at the wrong attitude, or holding nothing.
+    Every control step is captured, including the Jacobian finite-difference
+    probes, so the video is a complete record of what the arm did rather than
+    only the frames the dataset kept. Encoding is non-fatal and shares
+    render_rollout's encoder probe, so it works on the image's libx264-less LGPL
+    ffmpeg build.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Datagen Debug Video
+    groupLabel: Scripted Expert
+- name: DebugVideoCamera
+  type: STRING
+  default: external_D455
+  allowedValues:
+  - external_D455
+  - ego
+  description: >-
+    Which camera feeds DebugVideo. external_D455 is the third-person view, right
+    for anything about the arm's relationship to the rack or the mat; ego is the
+    wrist camera, right for what the fingers are doing.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Debug Video Camera
+    groupLabel: Scripted Expert
+
+# ------------------------------------------------------------- training ------
+- name: TrainSteps
+  type: INT
+  default: 20000
+  minValue: 1
+  maxValue: 500000
+  userInterface:
+    control: SPIN_BOX
+    label: Train Steps
+    groupLabel: Training
+- name: TrainBatchSize
+  type: INT
+  default: 8
+  minValue: 1
+  maxValue: 256
+  userInterface:
+    control: SPIN_BOX
+    label: Train Batch Size
+    groupLabel: Training
+- name: ActNActionSteps
+  type: INT
+  default: 20
+  minValue: 1
+  maxValue: 100
+  description: >-
+    ACT actions executed open-loop per observation (n_action_steps; chunk_size
+    stays 100). The default ACT behaviour replays the full 100-step chunk blind
+    (~3.3 s at 30 fps), so the policy commits to a whole plan from one frame and
+    never re-observes to time the gripper close. A small value runs closed-loop:
+    predict 100, execute this many, then re-observe.
+  userInterface:
+    control: SPIN_BOX
+    label: ACT Action Steps (closed-loop)
+    groupLabel: Training
+
+# --------------------------------------------------------------- render ------
+- name: RenderEpisodes
+  type: INT
+  default: 3
+  minValue: 1
+  maxValue: 100
+  description: Policy rollouts to run. All of them go into one MP4.
+  userInterface:
+    control: SPIN_BOX
+    label: Render Episodes
+    groupLabel: Render
+- name: RenderCamera
+  type: STRING
+  default: external_D455
+  allowedValues:
+  - external_D455
+  - ego
+  description: >-
+    Which of the environment's two cameras records the video. external_D455 is
+    the third-person lightbox view; ego is the wrist camera.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Render Camera
+    groupLabel: Render
+
+# --------------------------------------------------------------- evaluate ----
+# The Evaluate step fans out over EvalShards independent tasks. Policy
+# evaluation is embarrassingly parallel -- every episode is an independent
+# sample of the same policy -- so the only real design question is how coarsely
+# to shard it, which is what EvalEpisodesPerShard controls.
+- name: EvalShards
+  type: INT
+  default: 8
+  minValue: 1
+  maxValue: 200
+  description: >-
+    Number of PARALLEL Evaluate tasks. Each one runs EvalEpisodesPerShard
+    episodes at its own seed, so total episodes = EvalShards x
+    EvalEpisodesPerShard and the whole grid can run in the wall-clock time of one
+    shard, given enough workers.
+    Fan-out width is bounded by the fleet's maxWorkerCount, not by this number:
+    more shards than workers still works, they just queue.
+    Set this ABOVE your worker count only when you want a queue; set it EQUAL to
+    the worker count for the shortest wall clock.
+  userInterface:
+    control: SPIN_BOX
+    label: Evaluate Shards (parallel tasks)
+    groupLabel: Evaluate
+- name: EvalEpisodesPerShard
+  type: INT
+  default: 12
+  minValue: 1
+  maxValue: 500
+  description: >-
+    Episodes each shard runs. This is the shard-granularity knob, and it must
+    stay CHUNKY -- do not drop it to 1 to get more parallelism.
+    Every task pays a fixed startup cost that an episode does not amortize: a
+    worker that has never pulled the ~9 GB image spends ~4 minutes on the pull,
+    and a cold Omniverse shader cache costs a further ~347 s of Kit boot (~35 s
+    once the cache is warm -- a measured 9.9x). An episode is only ~15 s of sim.
+    So one-episode shards would spend the overwhelming majority of every task's
+    wall clock on startup, and the fan-out would look impressive while
+    delivering almost no throughput.
+    The default of 12 puts a warm shard at roughly 3-6 minutes of rollout
+    against ~35 s of boot, i.e. startup is under ~20% of the task. Raise it if
+    your shards are startup-dominated; lower it only if you are demonstrating
+    width rather than measuring a policy.
+    Move this together with EvalNumEnvs. The two compose multiplicatively --
+    total episodes is EvalShards x this, and the number of SEQUENTIAL episode
+    batches per shard is ceil(this / EvalNumEnvs) -- so raising EvalNumEnvs
+    without raising this makes shards startup-dominated again, and raising this
+    without raising EvalNumEnvs pushes tasks past the 30-minute task length AWS
+    Batch's own Spot guidance advises against (and this fleet is Spot).
+    Keep it a multiple of EvalNumEnvs so no batch simulates envs whose episodes
+    are then discarded.
+  userInterface:
+    control: SPIN_BOX
+    label: Episodes per Shard
+    groupLabel: Evaluate
+- name: EvalNumEnvs
+  type: INT
+  default: 12
+  minValue: 1
+  maxValue: 256
+  description: >-
+    Isaac Lab environments each Evaluate shard simulates IN PARALLEL, in one
+    process, on one GPU. This is the OTHER parallelism axis and on published
+    numbers it is the bigger one: NVIDIA's Isaac Lab-Arena eval speedup is 40x
+    (4096 envs on 8 GPUs), while multi-machine fan-out over single-env shards
+    measured 5x here. Episodes run in batches of this size --
+    ceil(EvalEpisodesPerShard / EvalNumEnvs) of them -- exactly as LeRobot's
+    lerobot_eval.py does with --eval.batch_size. Total episodes stays
+    EvalShards x EvalEpisodesPerShard whatever this is. Keep
+    EvalEpisodesPerShard a multiple of it, or the last batch simulates envs whose
+    episodes are discarded.
+    Why 12, not 25 or 1: NVIDIA's eval guidance is 10-30 (IsaacLabEvalTasks) and
+    IsaacLab-Arena ships 25, but on 48 GB L40-class GPUs with a lighter
+    observation spec. This task renders TWO 640x480 TiledCameras with THREE
+    annotators each (rgb, depth, colorized instance-id segmentation) at
+    rendering_mode="quality", plus a lightbox studio USD, an articulated SO-101,
+    a mat, three vials and a rack PER ENV. The two published fits bracketing that
+    spec disagree ~4x: ManiSkill3's Isaac Lab 640x480 sweep extrapolates to ~38
+    envs on 24 GB, Isaac Lab's own COMPASS+NuRec fit (9 GB + 1.3 GB x num_envs)
+    to ~10-11. This fleet offers a10g and l4, both 24 GB, and may hand a shard
+    either, so the default must be safe on the SMALLER fit. 12 is the bottom of
+    NVIDIA's band, inside both fits, and makes the default 12 episodes one batch.
+    PIN IT AND REPORT IT -- a correctness knob, not only a speed knob. NVIDIA
+    documents the renderer as "stochastic in nature" with no determinism
+    guarantee (issue #3505); anti-aliasing switches DLAA/DLSS on the COMBINED
+    tiled resolution, a function of env count (PR #1246); and TiledCamera quality
+    degradation with rising env count is an OPEN issue (#1031). For a vision
+    policy the image IS the observation, so rates measured at different values
+    are not guaranteed comparable. Every shard's JSON records it and Aggregate
+    reports a per-num_envs split rather than averaging.
+  userInterface:
+    control: SPIN_BOX
+    label: Envs per Shard (in-process)
+    groupLabel: Evaluate
+- name: EvalDeterministicScene
+  type: STRING
+  default: 'false'
+  allowedValues:
+  - 'true'
+  - 'false'
+  description: >-
+    Pin EVERY reset-event range in the environment -- object poses, light
+    exposure, mat rotation, camera focal length, external camera pose, and the
+    DR variant's sky light -- so every env in every episode starts from an
+    identical scene, and set rack_placement_prob to 0.
+    This is the control for an EvalNumEnvs A/B, and it exists because Isaac Lab
+    has no per-env seed API. gym.vector -- which LeRobot's vectorized eval uses
+    -- takes a LIST of seeds and gives episode k the same initial state at any
+    batch size. Isaac Lab draws reset randomization from one stage-global RNG, so
+    the initial conditions episode k sees are NOT invariant under EvalNumEnvs and
+    a raw A/B confounds "the renderer changed" with "the vials were somewhere
+    else". With this on there is nothing left to vary, so any difference in
+    outcome between two EvalNumEnvs values is attributable to rendering and
+    physics-ordering effects.
+    Note the nominal -Eval variant is NOT un-randomized: it already jitters light
+    exposure, mat yaw, ego focal length and external camera pose. That is why
+    this flag zeroes every range it can find rather than a known list.
+    Leave it 'false' for a real measurement -- with it on, every episode is the
+    same episode, so the success rate is a Bernoulli sample of one scene rather
+    than an estimate over a distribution.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Deterministic Scene (A/B control)
+    groupLabel: Evaluate
+- name: EvalBaseSeed
+  type: INT
+  default: 20001
+  minValue: 0
+  maxValue: 2000000000
+  description: >-
+    Seed of shard 1. Shard i gets EvalBaseSeed + (i-1) x 1000, so the shards'
+    seed neighbourhoods cannot overlap and each shard is an independent sample
+    of the policy rather than a repeat of its neighbour.
+    Deliberately distinct from the Seed parameter that Datagen and Render use:
+    evaluating on the seeds the data was generated from would measure
+    memorisation, not generalisation.
+  userInterface:
+    control: SPIN_BOX
+    label: Evaluate Base Seed
+    groupLabel: Evaluate
+- name: EvalRandomize
+  type: STRING
+  default: alternate
+  allowedValues:
+  - alternate
+  - 'on'
+  - 'off'
+  description: >-
+    Which environment variant each shard evaluates in, i.e. the
+    domain-randomization condition. Uses the same -DR-Eval / -Eval task pair
+    Datagen selects with Randomize, so it layers on the workshop's five
+    randomization terms (robot colour, HDRI sky light, mat rotation, camera
+    focal length, camera pose).
+    'alternate' (default): odd shards nominal, even shards randomized. One
+    submit then yields BOTH numbers plus the gap between them, which is the
+    interesting result -- a policy that scores well nominal and badly randomized
+    has not generalized. Prefer an even EvalShards so the two conditions get
+    equal episode counts.
+    'on' / 'off': every shard in one condition.
+    Note Render (step 3) always uses the nominal variant, because its job is to
+    show the policy rather than the randomizer.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Evaluate Domain Randomization
+    groupLabel: Evaluate
+- name: EvalVideo
+  type: STRING
+  default: 'true'
+  allowedValues:
+  - 'true'
+  - 'false'
+  description: >-
+    Write eval/shard_NN.mp4 per shard, giving a grid of rollout videos next to
+    the aggregate number. 'false' skips the encode AND the per-step GPU-to-CPU
+    frame copy that feeds it, which is the cheapest way to make a wide fan-out
+    faster when the success rate is the only deliverable.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Evaluate Videos
+    groupLabel: Evaluate
+
+# ------------------------------------------------------------ container ------
+- name: ContainerImage
+  type: STRING
+  default: isaacsim-so101-workshop:2.3.2
+  description: >-
+    Image built from containers/isaacsim-so101-workshop/. There is deliberately
+    no working default: the built image contains Omniverse Kit and must not be
+    redistributed, so no public URI can be offered. Build it, push it to a
+    private registry you control, and pass that URI here.
+  userInterface:
+    control: LINE_EDIT
+    label: Container Image
+    groupLabel: Container
+- name: EcrLogin
+  type: STRING
+  default: 'false'
+  allowedValues:
+  - 'true'
+  - 'false'
+  description: >-
+    Run `aws ecr get-login-password | docker login` before pulling. The region
+    is parsed out of the image URI, so no extra parameter is needed -- and there
+    is deliberately no free-text "login command" parameter, which would be a
+    shell-injection hole by construction.
+  userInterface:
+    control: DROPDOWN_LIST
+    label: Log in to Amazon ECR
+    groupLabel: Container
+- name: ShaderCacheDir
+  type: STRING
+  default: /mnt/deadline-persistent/isaacsim-so101-cache
+  description: >-
+    Host directory for the Omniverse shader / OV / compute caches, the pip
+    cache, and the torch hub cache (ACT's ResNet-18 backbone weights). Keeping
+    it outside the session directory lets it survive across tasks, which turns
+    a multi-minute cold shader compile into seconds. The default points at a
+    fleet persistent volume (configure one with persistentVolumeConfiguration,
+    mountPath /mnt/deadline-persistent) so the cache also survives worker
+    replacement -- otherwise every new worker recompiles shaders from scratch.
+    If the path is not writable, the step logs a warning and falls back to
+    /tmp, so this default is safe on fleets without a persistent volume.
+    Note the container image itself is NOT cached here: Docker stores images
+    under /var/lib/docker on the root volume, so a new worker still re-pulls it.
+  userInterface:
+    control: LINE_EDIT
+    label: Shader Cache Dir (on worker)
+    groupLabel: Container
+- name: StepTimeoutSeconds
+  type: INT
+  default: 5400
+  minValue: 60
+  maxValue: 86400
+  description: >-
+    Wall-clock budget for the in-container command. The container exits on its
+    own at this point so Deadline Cloud's output sync still runs; a container
+    killed by the worker's task timeout loses all partial state and logs. Keep
+    this comfortably below the queue's task timeout.
+  userInterface:
+    control: SPIN_BOX
+    label: Step Timeout (s)
+    groupLabel: Container
+
+# ---------------------------------------------------------- environment ------
+- name: CondaPackages
+  type: STRING
+  default: ''
+  description: >-
+    Intentionally EMPTY. The container carries the entire Python runtime, so
+    there is nothing for a Conda queue environment to solve. The parameter is
+    kept so this bundle still submits cleanly to a queue that has one attached
+    (those templates default CondaPackages to "" and skip solving). Add packages
+    only if you need extra host-side tools.
+  userInterface:
+    control: LINE_EDIT
+    label: Conda Packages
+    groupLabel: Environment
+- name: CondaChannels
+  type: STRING
+  default: deadline-cloud
+  userInterface:
+    control: LINE_EDIT
+    label: Conda Channels
+    groupLabel: Environment
+
+# ----------------------------------------------------------------- paths -----
+- name: OutputDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: INOUT
+  description: >-
+    Shared work dir; holds dataset/, train/, checkpoint/, logs/ and the render
+    output. Pass an absolute path on submit.
+- name: JobScriptDir
+  type: PATH
+  objectType: DIRECTORY
+  dataFlow: IN
+  default: scripts
+  description: >-
+    Directory holding the bundled datagen + render Python scripts and
+    run_in_container.sh, staged to the worker as a job-attachment input.
+  userInterface:
+    control: HIDDEN
+
+steps:
+
+# =============================================================================
+- name: 1 - Datagen
+  description: >-
+    Scripted joint-space vial-into-rack pick in Isaac Lab, recorded as a LeRobot
+    v3.0 dataset. Every episode is verified by the environment's own
+    vial_placed_on_rack_termination() predicate; failures are discarded and
+    retried, and under-production exits non-zero.
+  hostRequirements:
+    attributes:
+    - {name: attr.worker.os.family, anyOf: [linux]}
+    amounts:
+    - {name: amount.worker.gpu, min: 1}
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - '{{Task.File.Run}}'
+    embeddedFiles:
+    # Free-text params are written to data files and read with $(cat ...) rather
+    # than interpolated into the script body. OpenJD substitutes {{Param.*}} as
+    # literal text BEFORE bash parses the line, so interpolating a value
+    # directly into the shell -- even inside quotes -- lets a value containing a
+    # quote, $(...), or backticks run as code on the worker, and a benign
+    # apostrophe (e.g. "place the kid's vial") breaks the script. Substituting
+    # into a data file keeps the value as data; $(cat) reads it back verbatim.
+    # This matters more here than in a pure-Python step, because these values go
+    # on to form a `docker run` command line.
+    #
+    # INT / FLOAT parameters and STRING parameters constrained by allowedValues
+    # are safe to interpolate directly: the schema already guarantees they
+    # cannot contain shell metacharacters.
+    - {name: Image, type: TEXT, data: "{{Param.ContainerImage}}"}
+    - {name: CacheDir, type: TEXT, data: "{{Param.ShaderCacheDir}}"}
+    - {name: Instruction, type: TEXT, data: "{{Param.Instruction}}"}
+    - {name: RepoId, type: TEXT, data: "{{Param.DatasetRepoId}}"}
+    - {name: OutDir, type: TEXT, data: "{{Param.OutputDir}}"}
+    - {name: ScriptDir, type: TEXT, data: "{{Param.JobScriptDir}}"}
+    - {name: FlipPreset, type: TEXT, data: "{{Param.FlipPreset}}"}
+    - name: Run
+      type: TEXT
+      runnable: true
+      data: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        echo "=== STEP 1/5 Datagen: {{Param.Episodes}} verified episodes ==="
+        IMAGE="$(cat '{{Task.File.Image}}')"
+        CACHE_DIR="$(cat '{{Task.File.CacheDir}}')"
+        INSTRUCTION="$(cat '{{Task.File.Instruction}}')"
+        REPO_ID="$(cat '{{Task.File.RepoId}}')"
+        OUT="$(cat '{{Task.File.OutDir}}')"
+        SCRIPT_DIR="$(cat '{{Task.File.ScriptDir}}')"
+        FLIP_PRESET="$(cat '{{Task.File.FlipPreset}}')"
+        mkdir -p "$OUT"
+
+        # The -DR-Eval / -Eval suffix is required: the non-Eval variants set
+        # terminations=None, so there is no success signal and every episode
+        # would be discarded.
+        if [ "{{Param.Randomize}}" = "true" ]; then
+          TASK="Lerobot-So101-Teleop-Vials-To-Rack-DR-Eval"
+        else
+          TASK="Lerobot-So101-Teleop-Vials-To-Rack-Eval"
+        fi
+
+        EXTRA=()
+        if [ "{{Param.ProbeOnly}}" = "true" ]; then
+          echo "ProbeOnly=true: printing calibration data, recording nothing."
+          EXTRA+=(--probe)
+        else
+          # Datagen regenerates from scratch. LeRobotRecorder.init_dataset()
+          # APPENDS to an existing dataset root, so a stale directory would
+          # silently mix runs.
+          rm -rf "$OUT/dataset"
+        fi
+        if [ "{{Param.DeterministicScene}}" = "true" ]; then
+          EXTRA+=(--deterministic-scene)
+        fi
+        if [ "{{Param.DebugVideo}}" = "true" ]; then
+          # Written under /outputs, i.e. inside OutputDir, so the job attachment
+          # brings it back whether or not the step succeeds -- and this step is
+          # EXPECTED to exit non-zero when it is filming a failure.
+          EXTRA+=(--debug-video /outputs/datagen_debug.mp4
+                  --debug-video-camera {{Param.DebugVideoCamera}})
+          rm -f "$OUT/datagen_debug.mp4"
+        fi
+        # Free text, so it goes through the data file rather than the script body.
+        if [ -n "$FLIP_PRESET" ]; then
+          EXTRA+=(--flip-preset "$FLIP_PRESET")
+        fi
+
+        bash "$SCRIPT_DIR/run_in_container.sh" \
+          --image "$IMAGE" --ecr-login "{{Param.EcrLogin}}" \
+          --cache-dir "$CACHE_DIR" --timeout {{Param.StepTimeoutSeconds}} \
+          --script-dir "$SCRIPT_DIR" --output-dir "$OUT" --phase datagen \
+          -- python /job_scripts/generate_dataset.py \
+               --task "$TASK" \
+               --episodes {{Param.Episodes}} \
+               --max-attempt-factor {{Param.MaxAttemptFactor}} \
+               --fps {{Param.Fps}} \
+               --episode-length-s {{Param.EpisodeLengthSeconds}} \
+               --seed {{Param.Seed}} \
+               --instruction "$INSTRUCTION" \
+               --repo-id "$REPO_ID" \
+               --grasp-z-offset {{Param.GraspZOffset}} \
+               --place-z-offset {{Param.PlaceZOffset}} \
+               --gripper-pitch-offset {{Param.GripperPitchOffset}} \
+               --reorient-offset {{Param.ReorientOffset}} \
+               --jaw-open {{Param.JawOpen}} \
+               --jaw-closed {{Param.JawClosed}} \
+               --hover-height {{Param.HoverHeight}} \
+               --lift-height {{Param.LiftHeight}} \
+               --plan {{Param.WaypointPlan}} \
+               --flip-hold-steps {{Param.FlipHoldSteps}} \
+               --vial-spawn {{Param.VialSpawn}} \
+               --capdown-spawn-z {{Param.CapDownSpawnZ}} \
+               --output-dir /outputs \
+               "${EXTRA[@]+"${EXTRA[@]}"}"
+
+        if [ "{{Param.ProbeOnly}}" != "true" ]; then
+          echo "=== Datagen done -> $OUT/dataset ==="
+          ls -la "$OUT/dataset/meta" || true
+        fi
+
+# =============================================================================
+- name: 2 - Train
+  description: >-
+    Finetunes a LeRobot ACT policy on the generated dataset with lerobot-train,
+    inside the same image, so the LeRobot that wrote the dataset is the LeRobot
+    that trains on it and the one that will load the checkpoint.
+  dependencies:
+  - dependsOn: 1 - Datagen
+  # Train is the memory-hungry step, and it needs MORE HOST RAM THAN THE GPU.
+  # On a 16 GiB worker it dies partway through with:
+  #   RuntimeError: Caught RuntimeError in DataLoader worker process 0.
+  #   DefaultCPUAllocator: can't allocate memory ... Error code 12
+  # i.e. host RAM exhaustion, not VRAM. The budget: --shm-size=8g reserves over
+  # half of a 16 GiB instance, then LeRobot's 4 DataLoader workers each decode
+  # 480x640 video through torchcodec, on top of a 52M-parameter ACT policy.
+  # 32 GiB leaves ~24 GiB outside /dev/shm, which fits comfortably.
+  #
+  # This is per-STEP on purpose: Datagen runs fine in ~7 GiB (measured 46% peak
+  # on a 15.4 GiB worker), so requiring 32 GiB fleet-wide would push it onto
+  # needlessly expensive instances. Per-step host requirements let each step ask
+  # for what it actually needs.
+  hostRequirements:
+    attributes:
+    - {name: attr.worker.os.family, anyOf: [linux]}
+    amounts:
+    - {name: amount.worker.gpu, min: 1}
+    - {name: amount.worker.memory, min: 32768}
+    - {name: amount.worker.vcpu, min: 8}
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - '{{Task.File.Run}}'
+    embeddedFiles:
+    # Free-text params via data files, not script interpolation (see Datagen).
+    - {name: Image, type: TEXT, data: "{{Param.ContainerImage}}"}
+    - {name: CacheDir, type: TEXT, data: "{{Param.ShaderCacheDir}}"}
+    - {name: RepoId, type: TEXT, data: "{{Param.DatasetRepoId}}"}
+    - {name: OutDir, type: TEXT, data: "{{Param.OutputDir}}"}
+    - {name: ScriptDir, type: TEXT, data: "{{Param.JobScriptDir}}"}
+    - name: Run
+      type: TEXT
+      runnable: true
+      data: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        echo "=== STEP 2/5 Train: ACT {{Param.TrainSteps}} steps ==="
+        # Probe mode records no dataset, so there is nothing to train on. Skip
+        # with success rather than letting the dataset guard below fail: a failed
+        # step marks the whole job FAILED, retries maxRetriesPerTask times against
+        # an error that can never clear, and cancels Render by dependency. Probe
+        # runs should come back green.
+        # ProbeOnly is an allowedValues parameter, so the schema guarantees it
+        # cannot contain shell metacharacters and is safe to interpolate.
+        if [ "{{Param.ProbeOnly}}" = "true" ]; then
+          echo "ProbeOnly=true: skipping Train (probe mode records no dataset)."
+          exit 0
+        fi
+        IMAGE="$(cat '{{Task.File.Image}}')"
+        CACHE_DIR="$(cat '{{Task.File.CacheDir}}')"
+        REPO_ID="$(cat '{{Task.File.RepoId}}')"
+        OUT="$(cat '{{Task.File.OutDir}}')"
+        SCRIPT_DIR="$(cat '{{Task.File.ScriptDir}}')"
+
+        # DatasetSource selects where lerobot-train reads the dataset from.
+        # allowedValues, so safe to interpolate.
+        if [ "{{Param.DatasetSource}}" = "huggingface-hub" ]; then
+          # Omit --dataset.root entirely and let LeRobot resolve DatasetRepoId
+          # from the Hub into HF_HOME (a mounted cache, so it survives re-runs).
+          # Useful for validating Train against a published dataset without
+          # first producing one, and it avoids pushing gigabytes of video
+          # through job attachments.
+          echo "DatasetSource=huggingface-hub: resolving '$REPO_ID' from the Hub."
+          DATASET_ROOT_ARG=""
+        else
+          if [ ! -f "$OUT/dataset/meta/info.json" ]; then
+            echo "ERROR: no dataset at $OUT/dataset (run Datagen first, place a" >&2
+            echo "       LeRobot v3.0 dataset there yourself, or set" >&2
+            echo "       DatasetSource=huggingface-hub to pull a published one)." >&2
+            exit 1
+          fi
+          DATASET_ROOT_ARG="--dataset.root=/outputs/dataset"
+        fi
+        # lerobot-train refuses to write into an existing output_dir.
+        rm -rf "$OUT/train"
+
+        # n_action_steps < chunk_size makes ACT run CLOSED-LOOP: it predicts a
+        # 100-action chunk but executes only n_action_steps before re-observing,
+        # so the policy can time the gripper close to actual vial contact
+        # instead of committing to a full ~3.3 s open-loop plan from one frame.
+        bash "$SCRIPT_DIR/run_in_container.sh" \
+          --image "$IMAGE" --ecr-login "{{Param.EcrLogin}}" \
+          --cache-dir "$CACHE_DIR" --timeout {{Param.StepTimeoutSeconds}} \
+          --script-dir "$SCRIPT_DIR" --output-dir "$OUT" --phase train \
+          -- lerobot-train \
+               "--dataset.repo_id=$REPO_ID" \
+               $DATASET_ROOT_ARG \
+               --policy.type=act \
+               --policy.device=cuda \
+               --policy.push_to_hub=false \
+               --policy.n_action_steps={{Param.ActNActionSteps}} \
+               --batch_size={{Param.TrainBatchSize}} \
+               --steps={{Param.TrainSteps}} \
+               --save_freq={{Param.TrainSteps}} \
+               --wandb.enable=false \
+               --job_name=act_so101_finetune \
+               --output_dir=/outputs/train
+
+        CKPT="$OUT/train/checkpoints/last/pretrained_model"
+        if [ ! -f "$CKPT/config.json" ]; then
+          echo "ERROR: no checkpoint at $CKPT" >&2
+          ls -R "$OUT/train/checkpoints" || true
+          exit 1
+        fi
+        rm -rf "$OUT/checkpoint"
+        mkdir -p "$OUT/checkpoint"
+        cp -r "$CKPT/." "$OUT/checkpoint/"
+        echo "=== Train done -> $OUT/checkpoint ==="
+
+# =============================================================================
+- name: 3 - Render
+  description: >-
+    Runs the finetuned policy in the non-randomized -Eval environment and
+    records an MP4, a final PNG, and render_summary.json with a per-episode
+    success flag taken from the environment's own success predicate.
+  dependencies:
+  - dependsOn: 2 - Train
+  # Render loads the trained policy AND runs Isaac Sim, so it carries both the
+  # torch and the Kit memory footprint. Given Train's OOM on a 16 GiB worker,
+  # hold the same 32 GiB floor here rather than discovering the limit again.
+  hostRequirements:
+    attributes:
+    - {name: attr.worker.os.family, anyOf: [linux]}
+    amounts:
+    - {name: amount.worker.gpu, min: 1}
+    - {name: amount.worker.memory, min: 32768}
+    - {name: amount.worker.vcpu, min: 8}
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - '{{Task.File.Run}}'
+    embeddedFiles:
+    # Free-text params via data files, not script interpolation (see Datagen).
+    - {name: Image, type: TEXT, data: "{{Param.ContainerImage}}"}
+    - {name: CacheDir, type: TEXT, data: "{{Param.ShaderCacheDir}}"}
+    - {name: Instruction, type: TEXT, data: "{{Param.Instruction}}"}
+    - {name: RenameMap, type: TEXT, data: "{{Param.PolicyCameraRenameMap}}"}
+    - {name: OutDir, type: TEXT, data: "{{Param.OutputDir}}"}
+    - {name: ScriptDir, type: TEXT, data: "{{Param.JobScriptDir}}"}
+    - name: Run
+      type: TEXT
+      runnable: true
+      data: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        echo "=== STEP 3/5 Render: {{Param.RenderEpisodes}} policy rollouts ==="
+        # See the note in Train: probe mode produces no checkpoint, so skip with
+        # success instead of failing on the checkpoint guard.
+        if [ "{{Param.ProbeOnly}}" = "true" ]; then
+          echo "ProbeOnly=true: skipping Render (probe mode produces no checkpoint)."
+          exit 0
+        fi
+        IMAGE="$(cat '{{Task.File.Image}}')"
+        CACHE_DIR="$(cat '{{Task.File.CacheDir}}')"
+        INSTRUCTION="$(cat '{{Task.File.Instruction}}')"
+        RENAME_MAP="$(cat '{{Task.File.RenameMap}}')"
+        OUT="$(cat '{{Task.File.OutDir}}')"
+        SCRIPT_DIR="$(cat '{{Task.File.ScriptDir}}')"
+
+        if [ ! -f "$OUT/checkpoint/config.json" ]; then
+          echo "ERROR: no checkpoint at $OUT/checkpoint (Train must run first)." >&2
+          exit 1
+        fi
+
+        bash "$SCRIPT_DIR/run_in_container.sh" \
+          --image "$IMAGE" --ecr-login "{{Param.EcrLogin}}" \
+          --cache-dir "$CACHE_DIR" --timeout {{Param.StepTimeoutSeconds}} \
+          --script-dir "$SCRIPT_DIR" --output-dir "$OUT" --phase render \
+          -- python /job_scripts/render_rollout.py \
+               --task "Lerobot-So101-Teleop-Vials-To-Rack-Eval" \
+               --checkpoint /outputs/checkpoint \
+               --instruction "$INSTRUCTION" \
+               --episodes {{Param.RenderEpisodes}} \
+               --fps {{Param.Fps}} \
+               --camera "{{Param.RenderCamera}}" \
+               --episode-length-s {{Param.EpisodeLengthSeconds}} \
+               --seed {{Param.Seed}} \
+               --rename-map "$RENAME_MAP" \
+               --output-dir /outputs
+
+        echo "=== Render done ==="
+        ls -la "$OUT"
+        cat "$OUT/render_summary.json" 2>/dev/null || true
+
+# =============================================================================
+- name: 4 - Evaluate
+  description: >-
+    Scores the trained policy on TWO composed axes of parallelism: EvalNumEnvs
+    Isaac Lab environments vectorized in-process on one GPU, across EvalShards
+    independent tasks on separate workers. Each task runs
+    EvalEpisodesPerShard rollouts at its own seed and in its own
+    domain-randomization condition, and writes eval/shard_NN.json with a
+    per-episode success flag plus (by default) eval/shard_NN.mp4 of env 0.
+    Nothing is shared between shards and no shard reads another shard's output,
+    so N shards run concurrently given N workers -- though NOT in the wall-clock
+    time of one: a service-managed fleet scales out at
+    scaleOutWorkersPerMinute (default 10/min) from zero, and that stagger is why
+    a measured 8-shard speedup is ~5x rather than 8x.
+    The axes are split the way NVIDIA's own eval framework splits them. Seeds and
+    episodes vectorize -- LeRobot's lerobot_eval.py and Isaac Lab both batch them
+    -- so they belong inside the process. What does NOT vectorize is the
+    CONDITION: the DR variant's dome light is at /World/sky_light, a stage-global
+    prim, so nominal and randomized lighting cannot coexist in one simulation at
+    any num_envs. IsaacLab-Arena's OSMO package independently shards per Run and
+    vectorizes the episodes within it.
+  dependencies:
+  # Depends on Train, NOT on Render. Evaluate needs only the checkpoint, so
+  # gating it behind the demo video would serialize the two for no reason: with
+  # this edge, Render and the whole Evaluate fan-out become READY together and
+  # run concurrently.
+  - dependsOn: 2 - Train
+  parameterSpace:
+    taskParameterDefinitions:
+    # ONE dimension, 1-based, so the task count is exactly EvalShards and a
+    # plain count parameter maps straight onto the range -- OpenJD 2023-09 has no
+    # arithmetic in format strings, so a 0-based space would need an
+    # "EvalShards - 1" that cannot be expressed. Same idiom as
+    # tile_render_with_maya_arnold's '1-{{Param.NumXTiles}}'.
+    #
+    # Deliberately NOT CHUNK[INT] + the TASK_CHUNKING extension (see
+    # monte_carlo_simulation). Chunking exists to BATCH many too-small tasks, and
+    # it decides the batch size at runtime from an observed runtime target. Here
+    # the batch size is the physically meaningful quantity, it is already an
+    # explicit parameter (EvalEpisodesPerShard), and it is chosen for the
+    # startup-cost reason documented on that parameter -- not something to
+    # rediscover per run. Chunking would also let the scheduler collapse the
+    # fan-out to fewer, wider tasks, which is precisely the property this step
+    # exists to demonstrate.
+    - name: ShardIndex
+      type: INT
+      range: '1-{{Param.EvalShards}}'
+  # Evaluate loads a policy AND runs Kit, exactly like Render, so it carries both
+  # the torch and the Isaac Sim footprint -- hold Render's 32 GiB floor.
+  #
+  # These minimums are checked against the FLEET'S DECLARED MINIMUM instance
+  # capabilities, not its maximum. Asking for more than the fleet floor makes
+  # every task NOT_COMPATIBLE and the step never runs, which at fan-out width
+  # means N stuck tasks rather than one.
+  hostRequirements:
+    attributes:
+    - {name: attr.worker.os.family, anyOf: [linux]}
+    amounts:
+    - {name: amount.worker.gpu, min: 1}
+    - {name: amount.worker.memory, min: 32768}
+    - {name: amount.worker.vcpu, min: 8}
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - '{{Task.File.Run}}'
+    embeddedFiles:
+    # Free-text params via data files, not script interpolation (see Datagen).
+    - {name: Image, type: TEXT, data: "{{Param.ContainerImage}}"}
+    - {name: CacheDir, type: TEXT, data: "{{Param.ShaderCacheDir}}"}
+    - {name: Instruction, type: TEXT, data: "{{Param.Instruction}}"}
+    - {name: RenameMap, type: TEXT, data: "{{Param.PolicyCameraRenameMap}}"}
+    - {name: OutDir, type: TEXT, data: "{{Param.OutputDir}}"}
+    - {name: ScriptDir, type: TEXT, data: "{{Param.JobScriptDir}}"}
+    - name: Run
+      type: TEXT
+      runnable: true
+      data: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        # ShardIndex is an INT task parameter, so the schema guarantees it holds
+        # no shell metacharacters and it is safe to interpolate.
+        SHARD={{Task.Param.ShardIndex}}
+        SHARD_ID="$(printf '%02d' "$SHARD")"
+        echo "=== STEP 4/5 Evaluate: shard $SHARD_ID of {{Param.EvalShards}}, {{Param.EvalEpisodesPerShard}} episodes across {{Param.EvalNumEnvs}} parallel envs ==="
+        # See the note in Train: probe mode produces no checkpoint, so skip with
+        # success instead of failing on the checkpoint guard. This matters more
+        # here than anywhere else in the job -- without it a probe run turns into
+        # EvalShards failed tasks, each retried maxRetriesPerTask times against
+        # an error that can never clear.
+        if [ "{{Param.ProbeOnly}}" = "true" ]; then
+          echo "ProbeOnly=true: skipping Evaluate (probe mode produces no checkpoint)."
+          exit 0
+        fi
+        IMAGE="$(cat '{{Task.File.Image}}')"
+        CACHE_DIR="$(cat '{{Task.File.CacheDir}}')"
+        INSTRUCTION="$(cat '{{Task.File.Instruction}}')"
+        RENAME_MAP="$(cat '{{Task.File.RenameMap}}')"
+        OUT="$(cat '{{Task.File.OutDir}}')"
+        SCRIPT_DIR="$(cat '{{Task.File.ScriptDir}}')"
+
+        if [ ! -f "$OUT/checkpoint/config.json" ]; then
+          echo "ERROR: no checkpoint at $OUT/checkpoint (Train must run first)." >&2
+          exit 1
+        fi
+
+        # Per-shard domain-randomization condition. Reuses the -DR-Eval / -Eval
+        # task pair Datagen selects with Randomize; the -Eval suffix is required
+        # either way, because the non-Eval variants set terminations=None and
+        # there would be no success signal to score.
+        # EvalRandomize is an allowedValues parameter, so safe to interpolate.
+        case "{{Param.EvalRandomize}}" in
+          'on')  COND=randomized ;;
+          'off') COND=nominal ;;
+          # 'alternate': odd shards nominal, even shards randomized, so one
+          # submit produces both numbers and the generalization gap between them.
+          *) if [ "$(( SHARD % 2 ))" -eq 0 ]; then COND=randomized; else COND=nominal; fi ;;
+        esac
+        if [ "$COND" = "randomized" ]; then
+          TASK="Lerobot-So101-Teleop-Vials-To-Rack-DR-Eval"
+        else
+          TASK="Lerobot-So101-Teleop-Vials-To-Rack-Eval"
+        fi
+
+        # Stride 1000 so shards' seed neighbourhoods cannot overlap however many
+        # episodes each one runs. Both operands are INT params: safe.
+        SEED="$(( {{Param.EvalBaseSeed}} + (SHARD - 1) * 1000 ))"
+        echo "[bundle] shard=$SHARD condition=$COND task=$TASK seed=$SEED"
+
+        # Create the directory but NEVER clear it. Shards run concurrently and,
+        # because OutputDir is dataFlow: INOUT, each worker has a local copy of
+        # whatever peers uploaded -- an `rm -rf "$OUT/eval"` here would delete
+        # sibling shards' results. Stale files from an earlier, wider run are
+        # filtered by the Aggregate step instead, which is the only place that
+        # can safely tell "stale" from "not finished yet".
+        mkdir -p "$OUT/eval"
+
+        # Per-shard output filenames are what make the fan-out safe: no two tasks
+        # write the same path, so the job-attachment output manifests merge
+        # cleanly and Aggregate sees all N results.
+        VIDEO_ARGS=(--video-path "/outputs/eval/shard_${SHARD_ID}.mp4")
+        if [ "{{Param.EvalVideo}}" != "true" ]; then
+          VIDEO_ARGS=(--no-video)
+        fi
+        # Only env 0 is recorded, however many are simulated. Recording all of
+        # them would multiply the per-step GPU->CPU frame copy by EvalNumEnvs --
+        # the dominant per-env host cost -- and a tiled grid of N shrunken views
+        # cannot show a 4 mm vial tip, which is the thing the video is for. The
+        # MP4 therefore holds ceil(EvalEpisodesPerShard / EvalNumEnvs) episodes,
+        # not all of them; the success rate is over ALL envs and is in the JSON.
+        EXTRA=()
+        if [ "{{Param.EvalDeterministicScene}}" = "true" ]; then
+          EXTRA+=(--deterministic-scene)
+        fi
+
+        # Reuses render_rollout.py rather than adding a second rollout loop. That
+        # script already owns policy loading, the closed-loop ACT rollout, the
+        # success predicate, the MP4/PNG writers, the camera rename map, the
+        # torch.no_grad() (never inference_mode) rule that keeps multi-episode
+        # runs from dying on episode 1's reset, and the hard-exit watchdog. A
+        # second copy would have to re-derive all of that and would drift.
+        bash "$SCRIPT_DIR/run_in_container.sh" \
+          --image "$IMAGE" --ecr-login "{{Param.EcrLogin}}" \
+          --cache-dir "$CACHE_DIR" --timeout {{Param.StepTimeoutSeconds}} \
+          --script-dir "$SCRIPT_DIR" --output-dir "$OUT" \
+          --phase "eval${SHARD_ID}" \
+          -- python /job_scripts/render_rollout.py \
+               --task "$TASK" \
+               --checkpoint /outputs/checkpoint \
+               --instruction "$INSTRUCTION" \
+               --episodes {{Param.EvalEpisodesPerShard}} \
+               --num-envs {{Param.EvalNumEnvs}} \
+               --video-env 0 \
+               --fps {{Param.Fps}} \
+               --camera "{{Param.RenderCamera}}" \
+               --episode-length-s {{Param.EpisodeLengthSeconds}} \
+               --seed "$SEED" \
+               --shard "$SHARD" \
+               --condition "$COND" \
+               --rename-map "$RENAME_MAP" \
+               --summary-path "/outputs/eval/shard_${SHARD_ID}.json" \
+               "${VIDEO_ARGS[@]}" \
+               "${EXTRA[@]+"${EXTRA[@]}"}" \
+               --output-dir /outputs
+
+        echo "=== Evaluate shard $SHARD_ID done ==="
+        cat "$OUT/eval/shard_${SHARD_ID}.json" || true
+
+# =============================================================================
+- name: 5 - Aggregate
+  description: >-
+    Reduces every eval/shard_*.json into one eval_summary.json -- overall success
+    rate, per-shard and per-condition breakdowns, total episode count, the list
+    of shard videos -- and prints the same thing as a table to the task log, so
+    the result of the whole fan-out can be read straight off this one log.
+  dependencies:
+  - dependsOn: 4 - Evaluate
+  # NO amount.worker.gpu, and no memory or vCPU floor either. This step reads a
+  # handful of small JSON files with the worker's own python3: no Isaac Sim, no
+  # CUDA, no torch, and -- because it does not go through
+  # run_in_container.sh -- no ~9 GB image pull. On a fleet that has never pulled
+  # the image that is a ~4 minute saving on a step whose actual work is
+  # milliseconds.
+  #
+  # Dropping the GPU requirement is valid and it is what
+  # vllm_lm_eval_leaderboard's Aggregate step does too. Be clear about what it
+  # buys, though: hostRequirements are a compatibility FILTER, not a request. On
+  # a queue whose only fleet is this GPU fleet, this step still lands on a GPU
+  # worker. The win is that the step is now portable -- associate a cheap CPU
+  # fleet with the queue and Aggregate schedules there, while Evaluate cannot.
+  hostRequirements:
+    attributes:
+    - {name: attr.worker.os.family, anyOf: [linux]}
+  script:
+    actions:
+      onRun:
+        command: bash
+        args:
+        - '{{Task.File.Run}}'
+    embeddedFiles:
+    # Free-text params via data files, not script interpolation (see Datagen).
+    - {name: OutDir, type: TEXT, data: "{{Param.OutputDir}}"}
+    - {name: ScriptDir, type: TEXT, data: "{{Param.JobScriptDir}}"}
+    - name: Run
+      type: TEXT
+      runnable: true
+      data: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        echo "=== STEP 5/5 Aggregate: reducing {{Param.EvalShards}} eval shards ==="
+        # Probe mode evaluates nothing, so there is nothing to reduce. Skip with
+        # success, same as Train, Render and Evaluate, so a probe run stays green.
+        if [ "{{Param.ProbeOnly}}" = "true" ]; then
+          echo "ProbeOnly=true: skipping Aggregate (probe mode evaluates nothing)."
+          exit 0
+        fi
+        OUT="$(cat '{{Task.File.OutDir}}')"
+        SCRIPT_DIR="$(cat '{{Task.File.ScriptDir}}')"
+
+        # aggregate_eval.py is stdlib-only and Python 3.9 compatible, which is
+        # what lets it run on the worker's interpreter with no conda queue
+        # environment and no pip install. Amazon Linux 2023 -- the
+        # service-managed fleet worker OS -- ships python3.9 as python3.
+        PY="$(command -v python3 || command -v python || true)"
+        if [ -z "$PY" ]; then
+          echo "ERROR: no python3 on the worker's PATH, so this step cannot run" >&2
+          echo "       outside a software environment. Either attach a Conda queue" >&2
+          echo "       environment with 'python', or add amount.worker.gpu back and" >&2
+          echo "       route this through run_in_container.sh like the other steps." >&2
+          exit 70
+        fi
+
+        "$PY" "$SCRIPT_DIR/aggregate_eval.py" \
+          --output-dir "$OUT" \
+          --expected-shards {{Param.EvalShards}}
