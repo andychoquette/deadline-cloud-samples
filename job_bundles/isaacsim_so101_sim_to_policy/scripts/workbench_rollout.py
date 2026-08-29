@@ -219,7 +219,7 @@ def build(task=None, checkpoint=None, instruction=None, episode_length_s=15.0,
 
     _SESSION = Session(env, iface, queues, policy_device, actions, home,
                        task, checkpoint, instruction)
-    log(f"ready in {time.time() - t0:.0f}s -- call wr.run()")
+    log(f"ready in {time.time() - t0:.0f}s")
     return _SESSION
 
 
@@ -347,11 +347,28 @@ def run(episodes=1, instruction=None, warmup_steps=10, build_kwargs=None):
 
 
 def start(episodes=1, instruction=None, warmup_steps=10, build_kwargs=None):
-    """Same episode, driven from Kit's update loop. Returns immediately.
+    """Run episodes from Kit's update loop. Returns immediately, safely.
 
-    Use this if a future Isaac Lab release stops pumping the app inside
-    ``env.step()`` and ``run()`` freezes the UI. The result line appears in the
-    Console window when the episode finishes, not in the Script Editor.
+    Use this from the Script Editor. ``run()`` blocks, and blocking inside the
+    Script Editor is not merely slow -- it is broken:
+
+      RuntimeError: Cannot enter into task <X> while another task
+      <ScriptEditorWidget._execute_script_async()> is being executed
+
+    Kit refuses to enter a coroutine while another task holds the loop, and Isaac
+    Lab awaits coroutines while it builds a scene (``_is_usd_path_available()``
+    among them, so asset resolution fails *silently*). Everything Kit wants to run
+    is refused too: the USD change watcher, the renderer menubar, notifications,
+    even a plain ``asyncio.sleep()``.
+
+    So the build cannot happen in the caller's frame. It happens on the FIRST
+    update callback instead -- a plain callback popped from Kit's update stream,
+    with no task on the stack, which is why the same code works there. That is
+    also why ``--run-script`` always worked while the Script Editor did not.
+
+    Consequence worth knowing: the result line lands in the Console window, not
+    in the Script Editor, because the Script Editor's statement finished long
+    before the episode did.
     """
     global _ASYNC
     if _ASYNC is not None and not _ASYNC.get("done"):
@@ -360,22 +377,43 @@ def start(episodes=1, instruction=None, warmup_steps=10, build_kwargs=None):
 
     import omni.kit.app
 
-    session = build(**(build_kwargs or {}))
-    state = _episode_setup(session, instruction, warmup_steps)
-    state["task"] = session.task
-    _ASYNC = {"state": state, "episode": 0, "episodes": episodes, "done": False,
-              "busy": False, "results": [], "sub": None}
+    # Nothing heavy here on purpose. See the docstring.
+    _ASYNC = {
+        "phase": "build",
+        "session": None,
+        "state": None,
+        "episode": 0,
+        "episodes": episodes,
+        "done": False,
+        "busy": False,
+        "results": [],
+        "sub": None,
+        "build_kwargs": dict(build_kwargs or {}),
+    }
 
     def on_update(_event):
         ctx = _ASYNC
         # Reentrancy guard, and it is not optional: env.step() calls
         # SimulationContext.render(), which calls app.update(), which pops this
         # very event stream -- so without the flag this callback re-enters itself
-        # mid-step and interleaves two half-steps.
+        # mid-step and interleaves two half-steps. It guards the build for the
+        # same reason: build() pumps the app too.
         if ctx["busy"] or ctx["done"]:
             return
         ctx["busy"] = True
         try:
+            if ctx["phase"] == "build":
+                log("building env and loading policy off the update loop; "
+                    "the viewport will stall briefly")
+                ctx["session"] = build(**ctx["build_kwargs"])
+                ctx["state"] = _episode_setup(
+                    ctx["session"], instruction, warmup_steps
+                )
+                ctx["state"]["task"] = ctx["session"].task
+                ctx["phase"] = "step"
+                return
+
+            session = ctx["session"]
             if _episode_step(session, ctx["state"]):
                 ctx["results"].append(_report(ctx["state"]))
                 ctx["episode"] += 1
@@ -383,8 +421,9 @@ def start(episodes=1, instruction=None, warmup_steps=10, build_kwargs=None):
                     ctx["done"] = True
                     ctx["sub"] = None  # unsubscribe
                 else:
-                    ctx["state"] = _episode_setup(session, instruction,
-                                                  warmup_steps)
+                    ctx["state"] = _episode_setup(
+                        session, instruction, warmup_steps
+                    )
                     ctx["state"]["task"] = session.task
         except Exception as exc:  # noqa: BLE001
             import traceback
@@ -400,8 +439,8 @@ def start(episodes=1, instruction=None, warmup_steps=10, build_kwargs=None):
         .get_update_event_stream()
         .create_subscription_to_pop(on_update, name="workbench_rollout.step")
     )
-    log(f"started {episodes} episode(s) on Kit's update loop; "
-        "the result line will print when it finishes")
+    log(f"queued {episodes} episode(s) on Kit's update loop; "
+        "watch the Console window for the result")
     return _ASYNC
 
 
@@ -409,9 +448,12 @@ def status():
     """Progress of a start() rollout, for pasting into the Script Editor."""
     if _ASYNC is None:
         return {"running": False, "results": []}
+    state = _ASYNC.get("state")
     return {"running": not _ASYNC["done"],
+            "phase": _ASYNC.get("phase", "step"),
             "episode": _ASYNC["episode"],
-            "step": _ASYNC["state"]["step"],
+            # None during the build phase: state does not exist until the env does.
+            "step": state["step"] if state else None,
             "results": _ASYNC["results"]}
 
 

@@ -122,6 +122,16 @@ DEADLINE_VENV="${DEADLINE_VENV:-$HOME/deadline-venv}"
 DEADLINE_HOME="${DEADLINE_HOME:-$HOME/isaac-gui/workbench-deadline-home}"
 AWS_DIR="${AWS_DIR:-$HOME/.aws}"
 MONITOR_CACHE="${MONITOR_CACHE:-$HOME/.cache/com.amazonaws.deadline.monitor}"
+# Overrides which job the panel's "Fetch Results" targets, via
+# ISAACSIM_DEADLINE_FETCH_JOB_ID. Empty by default, which is what you want:
+# the panel then fetches the last job you submitted from it.
+#
+# Set it to an ALREADY-FINISHED job when recording a demo, so the results beat
+# does not have to wait for a freshly submitted job to aggregate -- fetching a
+# job that is still running downloads nothing, which is correct and looks broken:
+#
+#   FETCH_JOB_ID=job-0123... bash workbench_gui.sh
+FETCH_JOB_ID="${FETCH_JOB_ID-}"
 SHM_SIZE="${SHM_SIZE:-8g}"
 DISPLAY_ARG="${DISPLAY:-:0}"
 # Empty = no timeout, which is the point of a persistent session. Set it to a
@@ -310,6 +320,7 @@ docker run --rm \
   -e "AWS_CONFIG_FILE=$AWS_DIR/config" \
   -e "OUTPUT_DIR=$OUTPUT_DIR" \
   -e "WORKBENCH_BUNDLE_DIR=$BUNDLE_DIR" \
+  -e "ISAACSIM_DEADLINE_FETCH_JOB_ID=$FETCH_JOB_ID" \
   -e "WORKBENCH_DEADLINE_VENV=$DEADLINE_VENV" \
   -e "WORKBENCH_SUBMITTER_SRC=$SUBMITTER_SRC" \
   -e "WORKBENCH_TIMEOUT_S=$TIMEOUT_S" \
