@@ -16,7 +16,7 @@ across runs, the same role `grasped=True` plays in the MuJoCo sample.
 Why this script exists rather than reusing the workshop's `lerobot_eval.py`:
 that script is a ZMQ *client* of a GR00T inference server
 (`run_gr00t_server.py`) that lives in a second, separate container. Running it
-on a worker would mean a daemon-process job environment plus another ~50 GB
+on a worker would mean a daemon-process job environment plus another ~9 GB
 image pull, to reach an inference server that can just as well be in-process.
 Meanwhile `LeRobotSO101Interface` already carries a complete LOCAL LeRobot
 inference path -- `make_policy` / `sim_obs_to_policy_processor` /
@@ -695,20 +695,14 @@ if __name__ == "__main__":
         traceback.print_exc()
         _code = 1
     finally:
-        # simulation_app.close() can ITSELF hang -- Kit teardown is a known hang,
-        # and Isaac Sim 6.0 added a shutdown watchdog precisely because of it. So
-        # arm our own watchdog before calling it: if close() has not returned in
-        # 45s, force the exit anyway. Without this, an exception whose traceback
-        # printed fine still leaves the task wedged until StepTimeoutSeconds.
-        import threading
-
-        _t = threading.Timer(45.0, lambda: os._exit(_code))
-        _t.daemon = True
-        _t.start()
-        try:
-            simulation_app.close()
-        except BaseException:  # noqa: BLE001
-            pass
+        # Flush, then exit. Order is the whole point: simulation_app.close() does
+        # not return -- Kit's fast-shutdown path terminates the process with
+        # status 0 -- so anything after it is unreachable and every non-zero
+        # _code would be discarded. Observed on the farm: a task printed
+        # "ERROR: only 0/1 episodes verified" and still reported SUCCEEDED.
+        #
+        # stdout is a pipe into tee, so it is block-buffered: flushing after
+        # close() would also lose the final error lines.
         try:
             sys.stdout.flush()
             sys.stderr.flush()

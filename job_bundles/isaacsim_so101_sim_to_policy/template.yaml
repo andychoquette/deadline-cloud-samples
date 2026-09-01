@@ -319,7 +319,7 @@ parameterDefinitions:
   description: >-
     Attitude the vials spawn in. Applied by mutating the parsed env cfg in
     process, before gym.make -- NOT by editing the task config, which lives
-    inside a 28.9 GB container image and would cost a rebuild and push per
+    inside a ~29 GB container image and would cost a rebuild and push per
     experiment.
     'lying' (default) is the shipped behaviour: rot = euler(0,90,0), horizontal
     on the mat.
@@ -541,70 +541,33 @@ parameterDefinitions:
     groupLabel: Evaluate
 - name: EvalEpisodesPerShard
   type: INT
-  default: 12
+  default: 16
   minValue: 1
   maxValue: 500
   description: >-
-    Episodes each shard runs. This is the shard-granularity knob, and it must
-    stay CHUNKY -- do not drop it to 1 to get more parallelism.
-    Every task pays a fixed startup cost that an episode does not amortize: a
-    worker that has never pulled the ~9 GB image spends ~4 minutes on the pull,
-    and a cold Omniverse shader cache costs a further ~347 s of Kit boot (~35 s
-    once the cache is warm -- a measured 9.9x). An episode is only ~15 s of sim.
-    So one-episode shards would spend the overwhelming majority of every task's
-    wall clock on startup, and the fan-out would look impressive while
-    delivering almost no throughput.
-    The default of 12 puts a warm shard at roughly 3-6 minutes of rollout
-    against ~35 s of boot, i.e. startup is under ~20% of the task. Raise it if
-    your shards are startup-dominated; lower it only if you are demonstrating
-    width rather than measuring a policy.
-    Move this together with EvalNumEnvs. The two compose multiplicatively --
-    total episodes is EvalShards x this, and the number of SEQUENTIAL episode
-    batches per shard is ceil(this / EvalNumEnvs) -- so raising EvalNumEnvs
-    without raising this makes shards startup-dominated again, and raising this
-    without raising EvalNumEnvs pushes tasks past the 30-minute task length AWS
-    Batch's own Spot guidance advises against (and this fleet is Spot).
-    Keep it a multiple of EvalNumEnvs so no batch simulates envs whose episodes
-    are then discarded.
+    Rollouts per Evaluate shard. Total episodes is EvalShards x this. Must be a
+    multiple of EvalNumEnvs, or the final partial batch still renders every env and
+    discards the surplus. Also amortizes the ~52 s warm worker startup: too few
+    episodes and boot dominates the task. See the README for sizing guidance.
   userInterface:
     control: SPIN_BOX
     label: Episodes per Shard
     groupLabel: Evaluate
 - name: EvalNumEnvs
   type: INT
-  default: 12
+  default: 8
   minValue: 1
   maxValue: 256
   description: >-
-    Isaac Lab environments each Evaluate shard simulates IN PARALLEL, in one
-    process, on one GPU. This is the OTHER parallelism axis and on published
-    numbers it is the bigger one: NVIDIA's Isaac Lab-Arena eval speedup is 40x
-    (4096 envs on 8 GPUs), while multi-machine fan-out over single-env shards
-    measured 5x here. Episodes run in batches of this size --
-    ceil(EvalEpisodesPerShard / EvalNumEnvs) of them -- exactly as LeRobot's
-    lerobot_eval.py does with --eval.batch_size. Total episodes stays
-    EvalShards x EvalEpisodesPerShard whatever this is. Keep
-    EvalEpisodesPerShard a multiple of it, or the last batch simulates envs whose
-    episodes are discarded.
-    Why 12, not 25 or 1: NVIDIA's eval guidance is 10-30 (IsaacLabEvalTasks) and
-    IsaacLab-Arena ships 25, but on 48 GB L40-class GPUs with a lighter
-    observation spec. This task renders TWO 640x480 TiledCameras with THREE
-    annotators each (rgb, depth, colorized instance-id segmentation) at
-    rendering_mode="quality", plus a lightbox studio USD, an articulated SO-101,
-    a mat, three vials and a rack PER ENV. The two published fits bracketing that
-    spec disagree ~4x: ManiSkill3's Isaac Lab 640x480 sweep extrapolates to ~38
-    envs on 24 GB, Isaac Lab's own COMPASS+NuRec fit (9 GB + 1.3 GB x num_envs)
-    to ~10-11. This fleet offers a10g and l4, both 24 GB, and may hand a shard
-    either, so the default must be safe on the SMALLER fit. 12 is the bottom of
-    NVIDIA's band, inside both fits, and makes the default 12 episodes one batch.
-    PIN IT AND REPORT IT -- a correctness knob, not only a speed knob. NVIDIA
-    documents the renderer as "stochastic in nature" with no determinism
-    guarantee (issue #3505); anti-aliasing switches DLAA/DLSS on the COMBINED
-    tiled resolution, a function of env count (PR #1246); and TiledCamera quality
-    degradation with rising env count is an OPEN issue (#1031). For a vision
-    policy the image IS the observation, so rates measured at different values
-    are not guaranteed comparable. Every shard's JSON records it and Aggregate
-    reports a per-num_envs split rather than averaging.
+    Isaac Lab environments each Evaluate shard simulates in parallel, in one
+    process, on one GPU. Episodes run in batches of this size, so keep
+    EvalEpisodesPerShard a MULTIPLE of it or the last batch renders envs whose
+    episodes are discarded. Bounded by VRAM, not preference: the measured fit for
+    this observation spec is about 9 GB + 1.3 GB per env, so 8 fits a 24 GB a10g or
+    l4 with headroom. Pin it and report it -- the renderer is documented as
+    stochastic and anti-aliasing switches on the combined tiled resolution, so
+    success rates measured at different values are not guaranteed comparable. See
+    the README for the derivation and for how this composes with EvalShards.
   userInterface:
     control: SPIN_BOX
     label: Envs per Shard (in-process)
@@ -616,25 +579,10 @@ parameterDefinitions:
   - 'true'
   - 'false'
   description: >-
-    Pin EVERY reset-event range in the environment -- object poses, light
-    exposure, mat rotation, camera focal length, external camera pose, and the
-    DR variant's sky light -- so every env in every episode starts from an
-    identical scene, and set rack_placement_prob to 0.
-    This is the control for an EvalNumEnvs A/B, and it exists because Isaac Lab
-    has no per-env seed API. gym.vector -- which LeRobot's vectorized eval uses
-    -- takes a LIST of seeds and gives episode k the same initial state at any
-    batch size. Isaac Lab draws reset randomization from one stage-global RNG, so
-    the initial conditions episode k sees are NOT invariant under EvalNumEnvs and
-    a raw A/B confounds "the renderer changed" with "the vials were somewhere
-    else". With this on there is nothing left to vary, so any difference in
-    outcome between two EvalNumEnvs values is attributable to rendering and
-    physics-ordering effects.
-    Note the nominal -Eval variant is NOT un-randomized: it already jitters light
-    exposure, mat yaw, ego focal length and external camera pose. That is why
-    this flag zeroes every range it can find rather than a known list.
-    Leave it 'false' for a real measurement -- with it on, every episode is the
-    same episode, so the success rate is a Bernoulli sample of one scene rather
-    than an estimate over a distribution.
+    Freeze scene randomization so every shard evaluates the same initial states.
+    Useful for A/B-ing a code change; not for measuring a policy, where the
+    variation is the point. See the README for why this and EvalRandomize are
+    separate knobs.
   userInterface:
     control: DROPDOWN_LIST
     label: Deterministic Scene (A/B control)

@@ -292,7 +292,7 @@ def parse_args():
 
     # --- scene overrides ---------------------------------------------------
     # Mutating the parsed env cfg rather than editing the task config: the task
-    # config lives inside a 28.9 GB container image, so anything that required
+    # config lives inside a ~29 GB container image, so anything that required
     # rebuilding it would cost an image build and push per experiment.
     # parse_env_cfg() hands back a plain configclass, so the same change costs
     # three lines here and takes effect before gym.make().
@@ -846,7 +846,7 @@ def apply_scene_overrides(env_cfg, args):
     """Mutate the parsed env cfg in place, BEFORE gym.make().
 
     Everything here could equally be done by editing the workshop's
-    `vials_to_rack_env_cfg.py` -- except that file lives inside a 28.9 GB
+    `vials_to_rack_env_cfg.py` -- except that file lives inside a ~29 GB
     container image, so every change would cost an image build and push. The cfg
     that `parse_env_cfg` returns is a plain configclass, so the same override
     costs a few lines and no rebuild.
@@ -1380,7 +1380,7 @@ def main():
     # with nothing in the dataset but meta/info.json. Train would then have
     # finetuned on an empty dataset.
     #
-    # Verified on a farm worker (job-59c41621017a4a9fae92defc2f356c6f):
+    # Verified on a farm worker (observed on a farm worker):
     # _marker_datagen_05_recorder_drained was written, _marker_datagen_06_
     # simapp_closed never was, and _inner_exit_datagen contained 0.
     #
@@ -1428,17 +1428,9 @@ if __name__ == "__main__":
         traceback.print_exc()
         _code = 1
     finally:
-        # See render_rollout.py: simulation_app.close() can itself hang, so bound
-        # it with a watchdog rather than trusting Kit's teardown to return.
-        import threading
-
-        _t = threading.Timer(45.0, lambda: os._exit(_code))
-        _t.daemon = True
-        _t.start()
-        try:
-            simulation_app.close()
-        except BaseException:  # noqa: BLE001
-            pass
+        # See render_rollout.py. simulation_app.close() does not return: it exits
+        # the process with status 0, so it must not run before os._exit(_code) or
+        # the exit code is lost. Flush first -- stdout is a pipe into tee.
         try:
             sys.stdout.flush()
             sys.stderr.flush()

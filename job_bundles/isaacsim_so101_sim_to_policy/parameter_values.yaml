@@ -70,6 +70,34 @@ parameterValues:
   - name: StepTimeoutSeconds
     value: 5400
 
+  # Evaluation fan-out. Pinned rather than left to the template defaults so a
+  # plain `deadline bundle submit` cannot silently pick a width nobody has run.
+  #
+  # EvalNumEnvs is bounded by VRAM, not by preference. The measured fit for this
+  # observation spec (two 640x480 cameras, three annotators) is roughly
+  # 9 GB + 1.3 GB per env, so 8 envs is ~19.4 GB and fits a 24 GB card with
+  # headroom. Raising it needs a bigger card, and a CUDA OOM in any one shard
+  # fails that task and cancels Aggregate, which loses the whole run's headline
+  # number.
+  #
+  # Keep EvalEpisodesPerShard a MULTIPLE of EvalNumEnvs. Episodes run in batches
+  # of EvalNumEnvs, and a partial final batch still renders every env: at 12
+  # episodes and 8 envs, 4 of the 16 simulated are discarded.
+  - name: EvalShards
+    value: 8
+  - name: EvalEpisodesPerShard
+    value: 16
+  - name: EvalNumEnvs
+    value: 8
+  - name: EvalBaseSeed
+    value: 20001
+  - name: EvalRandomize
+    value: alternate
+  - name: EvalDeterministicScene
+    value: "false"
+  - name: EvalVideo
+    value: "true"
+
   # Intentionally empty: the container carries the whole Python runtime, so a
   # Conda queue environment has nothing to solve.
   - name: CondaPackages

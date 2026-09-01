@@ -47,181 +47,6 @@ It is the Isaac Sim counterpart of
 contract: verify each episode, discard failures, and never let a partial dataset
 look like a complete one.
 
-## Parallel evaluation: what fans out and why it can
-
-`4 - Evaluate` is the embarrassingly-parallel step, and it is the reason this
-sample is more than a three-stage pipeline. Policy evaluation decomposes
-perfectly:
-
-- every episode is an **independent sample** of one fixed, frozen checkpoint;
-- no shard reads another shard's output, and no shard writes a path another
-  shard writes;
-- there is no shared mutable state, no cross-shard communication, and no
-  ordering requirement — only a final reduction.
-
-So the step declares a `parameterSpace` over a shard index and Deadline Cloud
-turns it into `EvalShards` independent tasks. `5 - Aggregate` then reduces them
-into a single number.
-
-The task count is deterministic and is purely a function of the parameter:
-
-```
-total episodes  = EvalShards × EvalEpisodesPerShard
-total job tasks = 4 + EvalShards    # 1 Datagen + 1 Train + 1 Render + N Evaluate + 1 Aggregate
-```
-
-### Two axes of parallelism, and fan-out is the smaller one
-
-Read this before quoting any speedup from this sample.
-
-| Axis | Parameter | What it is | Published scale |
-|------|-----------|------------|-----------------|
-| **In-process** | `EvalNumEnvs` | Isaac Lab environments vectorized in one process on one GPU, sharing one tiled render pass | NVIDIA's Isaac Lab-Arena eval speedup is **40×** — 4096 envs on 8 GPUs. Their *eval-specific* guidance is **10–30 envs** (`IsaacLabEvalTasks`); `IsaacLab-Arena` ships `num_envs: 25`. |
-| **Fleet** | `EvalShards` | Independent tasks on separate workers | **~5×** measured here at 8 shards — bounded by `scaleOutWorkersPerMinute` (default 10/min) scaling from zero, not by the rollout. |
-
-They compose, and the honest framing is **vectorize the rollouts, distribute the
-sweep**:
-
-```
-EvalShards × EvalNumEnvs = concurrent environments
-8          × 12          = 96
-```
-
-**What genuinely does not vectorize is the *condition*, not the seed.** Seeds and
-episodes batch fine — LeRobot's `lerobot_eval.py` takes `--eval.batch_size` and
-assigns per-episode seeds inside one process, and `EvalNumEnvs` now does the same
-here. But the `-DR-Eval` variant's dome light is at `prim_path="/World/sky_light"`,
-a **stage-global** prim, while every other asset in the scene is under
-`{ENV_REGEX_NS}`. Nominal and randomized lighting therefore cannot coexist in one
-simulation at any `num_envs`. That is why `EvalRandomize` splits across *shards*
-and the episodes do not. NVIDIA's own `IsaacLab-Arena` OSMO package independently
-shards per **Run** and vectorizes the episodes within it.
-
-### `EvalNumEnvs` is a correctness knob, not only a speed knob
-
-Pin it for a whole campaign and quote it with every success rate. Three cited
-reasons:
-
-- NVIDIA on [issue #3505](https://github.com/isaac-sim/IsaacLab/issues/3505):
-  "The current rendering pipeline is unfortunately **stochastic in nature**. We
-  don't yet have a good way to guarantee determinism across the rendered
-  outputs."
-- [PR #1246](https://github.com/isaac-sim/IsaacLab/pull/1246): the tiled image is
-  `(width × cols, height × rows)` with `cols = ceil(sqrt(N))`, and anti-aliasing
-  switches between DLAA and DLSS-performance on the **combined** resolution — so
-  "there may be visible quality differences when comparing render outputs of
-  different numbers of environments."
-- [Issue #1031](https://github.com/isaac-sim/IsaacLab/issues/1031), still **open**:
-  "Increasing the number of parallel environments results in severe degradation in
-  TiledCamera rendering quality."
-
-For a sim-to-real *vision* policy the image **is** the observation, so a
-parallelism knob that changes anti-aliasing changes the observation distribution.
-Every shard therefore records `num_envs` in its JSON, and `5 - Aggregate`
-**splits the success rate by `num_envs` and warns loudly** rather than averaging
-shards that disagree — which is exactly what a stale `eval/shard_NN.json` from an
-earlier run at a different `EvalNumEnvs` would otherwise cause, since `OutputDir`
-is `dataFlow: INOUT`. **Use a fresh `OutputDir` per experiment.**
-
-Why the default is **12**, and not 25 or 1: NVIDIA's eval band starts at 10, and
-this task's observation spec is far heavier than the configs those numbers come
-from — two 640×480 `TiledCamera`s with three annotators each (`rgb`, `depth`,
-colorized `instance_id_segmentation_fast`) at `rendering_mode="quality"`, plus a
-lightbox studio USD, an articulated SO-101, a mat, three vials and a rack **per
-env**. The two published fits that bracket it disagree by ~4×: extrapolating
-ManiSkill3's Isaac Lab 640×480 sweep gives ~38 envs on 24 GB, while Isaac Lab's
-own COMPASS + NuRec empirical fit (`9 GB + 1.3 GB × num_envs`) gives ~10–11. A
-service-managed fleet offering `a10g`/`l4` (both 24 GB) *and* `l40s` (48 GB) may
-hand a shard any of them, so the default has to be safe on the smaller fit.
-**Measure your own ceiling** — every shard logs
-`[render-throughput] … env_steps_per_s=` and records `env_steps_per_second` in its
-JSON, so a two-value A/B settles it in one submit.
-
-### What the MP4 shows at `EvalNumEnvs > 1`
-
-**Only env 0**, and only `ceil(EvalEpisodesPerShard / EvalNumEnvs)` episodes of
-it. Recording all N would multiply the per-step GPU→CPU frame copy — the dominant
-per-env host cost — by N, and a tiled grid of N shrunken views cannot show a 4 mm
-vial tip, which is what the video is for. So **the video is a sample, not the
-measurement**: the success rate is over *all* envs and all episodes. An MP4 of a
-single failure next to a nonzero `success_rate` is expected, not a contradiction.
-`shard_NN.json` records `video_env` and `video_episodes` so this is never left to
-inference.
-
-**How many of those N tasks run simultaneously is a separate question**, and it is
-not something the template can guarantee. Given N workers that are already up, N
-shards finish in roughly the wall-clock time of one; given one worker, they run
-back-to-back and you get no speedup at all. The next section is about what
-decides which of those you get.
-
-Each shard gets its own seed (`EvalBaseSeed + (shard-1) × 1000`) and its own
-domain-randomization condition, and writes:
-
-| Path | Contents |
-|------|----------|
-| `OutputDir/eval/shard_NN.json` | Per-episode success flags — each tagged with its `batch`, `env` and final joint pose — plus that shard's seed, condition, task id, `num_envs`, rollout seconds and `env_steps_per_second`. |
-| `OutputDir/eval/shard_NN.mp4` | **Env 0's** rollouts only (unless `EvalVideo=false`) — see "What the MP4 shows" above. |
-| `OutputDir/eval_summary.json` | Written by Aggregate: overall success rate, `by_shard`, `by_condition`, **`by_num_envs`**, `num_envs_consistent`, episode count, summed rollout seconds and env-steps, video list. |
-
-> **The video encoder is a property of the pinned container image, and a missing
-> one fails silently.** `Mp4Writer` is deliberately non-fatal — a lost video must
-> not cost you the success metrics — so if ffmpeg cannot encode, the shard logs one
-> line and still exits 0 with correct metrics and **no MP4**. This is not
-> hypothetical: an 8-shard run produced JSON + PNG for 8/8 shards and an MP4 for
-> 0/8, because the image installs an **LGPL** FFmpeg build
-> (`ffmpeg-...-lgpl-shared`, required since torchcodec links ffmpeg's shared
-> libraries) and LGPL builds are compiled `--disable-libx264` — x264 is GPL.
->
-> `render_rollout.py` therefore **probes** `ffmpeg -encoders` at runtime and takes
-> the first of `libx264` → `libopenh264` → `mpeg4` that exists, with per-encoder
-> quality flags (`libopenh264` has no `-crf`, so it uses `-b:v`). Verified inside
-> the actual image rather than inferred: `libx264 present=False`,
-> `libopenh264 present=True`, `mpeg4 present=True`, and piping rawvideo to
-> `libopenh264 -b:v 4M -pix_fmt yuv420p -movflags +faststart` exits 0 producing
-> `codec_name=h264 640x480 nb_frames=30`.
->
-> If you rebuild the image with a different ffmpeg tarball, this can change again.
-> **`eval_summary.json` always keeps its `videos` key** (an empty list, never a
-> dropped key) and an empty list never fails Aggregate — so check that key, or grep
-> a shard log for `ffmpeg`, rather than assuming videos exist.
-
-Aggregate also prints a table to its task log, so the headline result can be read
-straight off one log without downloading anything. This is **real output** from an
-8-shard run on a service-managed GPU fleet:
-
-```
-=== Policy evaluation: 8 shards, 64 episodes ===
-
-shard  condition   seed   episodes  successes  success%  mean steps
------  ----------  -----  --------  ---------  --------  ----------
-1      nominal     20001  8         0          0.0       900
-2      randomized  21001  8         0          0.0       900
-3      nominal     22001  8         0          0.0       900
-4      randomized  23001  8         0          0.0       900
-5      nominal     24001  8         0          0.0       900
-6      randomized  25001  8         0          0.0       900
-7      nominal     26001  8         0          0.0       900
-8      randomized  27001  8         0          0.0       900
-
-condition   shards  episodes  successes  success%
-----------  ------  --------  ---------  --------
-nominal     4       32        0          0.0
-randomized  4       32        0          0.0
-
-OVERALL SUCCESS RATE: 0/64 = 0.0%
-```
-
-The `nominal` vs `randomized` gap is the interesting number: a policy that scores
-well nominal and badly randomized has not generalized.
-
-> The 0% above is **correct and expected for that particular run** — it evaluated
-> a checkpoint trained on an unrelated public dataset, purely to exercise the
-> harness. `mean steps 900` is the episode-length cap, i.e. every episode ran to
-> truncation without the success term ever firing. It is shown here rather than a
-> flattering invented number because it is what the pipeline actually printed, and
-> because it demonstrates the intended behaviour: **a 0% success rate is reported,
-> not treated as a failure.** All 8 shards and the Aggregate step exited 0.
-
 ## What problem it solves
 
 A policy trained on real-robot camera images cannot drive a simulator. The sim
@@ -252,6 +77,226 @@ Because the steps are independent and share the work directory, you can re-run a
 single step — for example, re-render from a new camera without re-generating data
 or re-training, or re-evaluate an existing checkpoint at a different shard width
 without touching anything upstream.
+
+## Prerequisites
+
+1. **A Deadline Cloud farm and queue with a Linux x86_64 GPU fleet** whose
+   workers have Docker and the NVIDIA Container Toolkit. Deadline Cloud
+   service-managed Linux GPU fleets have both. Raise the fleet's root volume to
+   at least **500 GiB** — the image unpacks to ~29 GB and the shader cache adds a few hundred MB.
+2. **Build the container image and push it to a registry you control.**
+
+   ```bash
+   cd ../../containers/isaacsim-so101-workshop
+   docker build -t isaacsim-so101-workshop:2.3.2 .
+   ```
+
+   Then push to your own private Amazon ECR repository — see
+   [`containers/isaacsim-so101-workshop/README.md`](../../containers/isaacsim-so101-workshop/README.md)
+   for the exact commands and the fleet-role permissions.
+
+   > **This bundle does not, and cannot, ship a working default image.** The
+   > built image contains Omniverse Kit, which may not be redistributed, so
+   > there is no public URI to point at. The base image
+   > `nvcr.io/nvidia/isaac-lab:2.3.2` is anonymously pullable from NVIDIA — no
+   > NGC account or API key needed — so building it yourself is a one-command
+   > prerequisite, not a licensing negotiation. Keep the built image private.
+3. **The Deadline Cloud CLI** configured (`deadline config show` resolves your
+   default farm and queue).
+
+A [Conda queue environment](https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/conda-queue-environment.html)
+is *not* required. The container carries the whole Python runtime, so
+`CondaPackages` defaults to empty; the parameter exists only so this bundle
+still submits cleanly to a queue that has one attached.
+
+## Submit
+
+```bash
+# Submit with an absolute, known output path (so outputs upload correctly):
+OUT="$(pwd)/output"; mkdir -p "$OUT"
+deadline bundle submit isaacsim_so101_sim_to_policy \
+  -p "ContainerImage=<account>.dkr.ecr.<region>.amazonaws.com/isaacsim-so101-workshop:2.3.2" \
+  -p EcrLogin=true \
+  -p "OutputDir=$OUT" \
+  -p EvalShards=8 -p EvalEpisodesPerShard=12 --yes
+```
+
+That submits `4 + 8 = 12` tasks, of which eight are Evaluate shards that all
+become schedulable at once. How many actually run concurrently is
+`min(EvalShards, workers the fleet has running)` — **match `EvalShards` to the
+worker count you expect** for the shortest wall clock. More shards than workers
+still works, they just queue.
+
+Or review parameters in a GUI before sending:
+
+```bash
+deadline bundle gui-submit isaacsim_so101_sim_to_policy
+```
+
+Watch progress and collect the videos and the aggregate number:
+
+```bash
+deadline job get --job-id <job-id>
+deadline job download-output --job-id <job-id>
+cat "$OUT/eval_summary.json"          # overall + per-shard + per-condition
+ls "$OUT/eval/"                       # shard_NN.json + shard_NN.mp4 grid
+```
+
+Or just read the `5 - Aggregate` task log, which contains the same table.
+
+### Recommended first real run: Train + Render on an existing dataset
+
+Datagen is the only step that depends on the calibration above. Train and Render
+do not. So the fastest way to prove the image, the fleet, the GPU wiring, and
+two thirds of the pipeline is to **skip Datagen** and run Train + Render against
+a LeRobot v3.0 dataset you already have — for example one of the workshop
+course's published SO-101 teleop datasets, or a dataset from the MuJoCo sample:
+
+```bash
+OUT="$(pwd)/output"; mkdir -p "$OUT/dataset"
+# place a LeRobot v3.0 dataset (meta/info.json + data/ + videos/) in $OUT/dataset
+deadline bundle submit isaacsim_so101_sim_to_policy \
+  -p "ContainerImage=<your-ecr-uri>" -p EcrLogin=true \
+  -p "DatasetRepoId=<the dataset's repo id>" \
+  -p "Instruction=<the instruction it was recorded with>" \
+  -p "OutputDir=$OUT" --yes
+```
+
+Then mark the Datagen step **`SUCCEEDED`** — do **not** cancel it:
+
+```bash
+aws deadline update-step --farm-id "$FARM" --queue-id "$QUEUE" --job-id "$JOB" \
+  --step-id "<datagen-step-id>" --target-task-run-status SUCCEEDED
+```
+
+> **Do not cancel Datagen.** Cancelling (or failing) a step transitively cancels
+> everything downstream of it, so `Train` and `Render` would be `CANCELED` too and
+> the whole job would end up doing nothing. Per the Deadline Cloud docs: "If StepA
+> fails, or if StepA is canceled, StepB moves to the CANCELED state." `SUCCEEDED`
+> is the only status that *resolves* a dependency edge and lets `Train` start.
+
+`Instruction` and `DatasetRepoId` must match the dataset, because ACT is
+conditioned on the instruction and `lerobot-train` resolves the dataset by repo
+id.
+
+Also note `OutputDir` is declared `dataFlow: INOUT`, so it is uploaded as an
+**input** as well as collected as an output. For a Train- or Render-only run,
+whatever the earlier step produced has to exist in your local `OutputDir` before
+you submit — run `deadline job download-output --job-id <previous-job>` first, or
+the step will fail its own "no dataset" / "no checkpoint" guard.
+
+## Parameters
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `Instruction` | `pick up the vial and place it in the rack` | Recorded on every frame, conditions training, and passed to the policy at render and evaluation time. One parameter for every step that uses it (Datagen, Render, Evaluate) so they cannot drift. |
+| `Episodes` | `50` | Target count of **verified** episodes. |
+| `MaxAttemptFactor` | `6` | Datagen gives up after `Episodes × this`. |
+| `Randomize` | `true` | Selects the `-DR-Eval` task for Datagen (robot colour, HDRI sky light, mat rotation, camera focal length, camera pose). Render always uses the non-randomized variant. |
+| `Fps` | `30` | Dataset and video frame rate. |
+| `EpisodeLengthSeconds` | `15.0` | Overrides the env cfg. The workshop's `-Eval` variants ship 7.5 s, too short for reach + grasp + reorient + insert + the 25-frame confirmation. |
+| `Seed` | `101` | Environment seed. |
+| `DatasetRepoId` | `local/so101_isaac_vials` | LeRobot repo id in the dataset metadata. |
+| `ProbeOnly` | `false` | Run Datagen in calibration-probe mode and record nothing. |
+| `GraspZOffset` | `0.075` | Measured off the SO-ARM101 collision meshes. Re-measure if you change the gripper. |
+| `GripperPitchOffset` | `0.0` | **Needs calibration.** |
+| `ReorientOffset` | `1.5708` | **Needs calibration** (sign especially). |
+| `JawOpen` / `JawClosed` | `0.6` / `-0.1` | **Needs calibration.** |
+| `TrainSteps` | `20000` | ACT finetuning steps. |
+| `TrainBatchSize` | `8` | Training batch size. |
+| `ActNActionSteps` | `20` | ACT actions executed open-loop per observation. Below `chunk_size` (100) to run closed-loop. |
+| `RenderEpisodes` | `3` | Policy rollouts, all in one MP4. |
+| `RenderCamera` | `external_D455` | `external_D455` is the third-person lightbox view; `ego` is the wrist camera. Also used by Evaluate. |
+| `EvalShards` | `8` | **Number of Evaluate tasks created.** Total job tasks = `4 + EvalShards`, deterministically. Observed *concurrency* is a separate matter — capped by `min(EvalShards, running workers)` and by whether the tasks last long enough for autoscaling to react. More shards than workers still works, they just queue. |
+| `EvalEpisodesPerShard` | `12` | Episodes per shard. **Keep it chunky** — see "Sizing the shards" below. Total episodes = `EvalShards × EvalEpisodesPerShard`. Keep it a multiple of `EvalNumEnvs`. |
+| `EvalNumEnvs` | `12` | **Environments each shard simulates in parallel, in one process, on one GPU** — the *other* parallelism axis, and on published numbers the bigger one. Episodes run in `ceil(EvalEpisodesPerShard / EvalNumEnvs)` batches, the scheme LeRobot's own `lerobot_eval.py` uses. **Pin it and report it** — see "Two axes of parallelism" below. |
+| `EvalDeterministicScene` | `false` | Pin *every* reset-event range (object poses, light exposure, mat yaw, focal length, camera pose, sky light) so every env in every episode starts from an identical scene. The control for an `EvalNumEnvs` A/B; not for a real measurement, because every episode becomes the same episode. |
+| `EvalBaseSeed` | `20001` | Seed of shard 1; shard *i* gets `EvalBaseSeed + (i-1) × 1000`. Deliberately distinct from `Seed`: evaluating on the seeds the data was generated from measures memorisation, not generalisation. |
+| `EvalRandomize` | `alternate` | `alternate` = odd shards nominal, even shards randomized, so one submit yields both numbers and the gap between them. `on` / `off` put every shard in one condition. Prefer an **even** `EvalShards` so the two conditions get equal episode counts. |
+| `EvalVideo` | `true` | Write `eval/shard_NN.mp4` per shard. `false` skips the encode *and* the per-step GPU→CPU frame copy that feeds it — the cheapest way to speed up a wide fan-out when only the success rate matters. |
+| `ContainerImage` | `isaacsim-so101-workshop:2.3.2` | **No working default is possible** — see Prerequisites. |
+| `EcrLogin` | `false` | `docker login` to Amazon ECR before pulling. The region is parsed from the image URI. |
+| `ShaderCacheDir` | `/mnt/deadline-persistent/isaacsim-so101-cache` | Host path for the Omniverse / pip / torch-hub caches, reused across tasks on the same worker. Defaults to a **fleet persistent volume** so it survives worker replacement; falls back to `/tmp` with a warning if the path is not writable, so it is safe on fleets without one. |
+| `StepTimeoutSeconds` | `5400` | In-container wall-clock budget, **shared by all steps**. Keep below the queue's task timeout so the container exits cleanly and outputs still upload. Raise it if you raise `EvalEpisodesPerShard` — see below. |
+| `CondaPackages` | `''` | Intentionally empty; the container carries the runtime. |
+| `CondaChannels` | `deadline-cloud` | Only read by a Conda queue environment, if one is attached. |
+| `OutputDir` | `output` | Shared work dir. Pass an **absolute** path on submit. |
+| `JobScriptDir` | `scripts` | Hidden. Holds the two Python entrypoints and `run_in_container.sh`, staged as a job-attachment input. |
+
+## Calibrate the scripted expert first
+
+The scripted expert reaches positions with a damped-least-squares servo whose
+Jacobian is measured by finite differences, so it needs **no link lengths and no
+analytic IK**. What it does need is a handful of geometric constants that can
+only be measured against the actual SO-ARM101 USD on a GPU.
+
+**Run the probe first.** It boots the environment, resets once, prints the joint
+names and limits, the home pose, the end-effector frame pose and quaternion,
+every body position, the vial / rack / slot poses, and a Jacobian self-test that
+commands a known 1 cm displacement and reports the measured one — then exits
+without recording:
+
+```bash
+OUT="$(pwd)/output"; mkdir -p "$OUT"
+deadline bundle submit isaacsim_so101_sim_to_policy \
+  -p "ContainerImage=<your-ecr-uri>" -p EcrLogin=true \
+  -p ProbeOnly=true -p "OutputDir=$OUT" --yes
+```
+
+Read `OutputDir/probe_summary.json` and `OutputDir/logs/datagen.log`, then set:
+
+| Parameter | How to read it off the probe |
+|-----------|------------------------------|
+| `GraspZOffset` | The z gap between the `gripper` body origin (which *is* the end-effector frame) and the pinch point between the jaws. |
+| `GripperPitchOffset` | The correction to the home gripper pitch that points the jaw at the mat. The expert holds `Pitch + Elbow + Wrist_Pitch` constant, which holds gripper pitch constant, so this one scalar is the whole grasp-orientation calibration. |
+| `ReorientOffset` | The gripper pitch change that stands a lying vial upright. The vials spawn horizontal but the success term requires `abs(vial up z) > 0.7`, so this rotation is what makes the task solvable at all. The sign depends on the gripper's frame convention. |
+| `JawOpen` / `JawClosed` | From the `Jaw` joint limits. |
+
+Uncalibrated, Datagen discards every attempt and **exits non-zero** rather than
+writing a bad dataset. That failure mode is deliberate: a miscalibrated expert
+produces a failed task, never a garbage dataset that Train would silently
+finetune on.
+
+`HoverHeight` and `LiftHeight` are job parameters. The remaining servo tuning
+(`--insert-clearance`, `--servo-tol`, `--servo-step-m`, `--servo-damping`,
+`--fd-delta`, `--jacobian-refresh`) is available on
+[`scripts/generate_dataset.py`](scripts/generate_dataset.py) only: the defaults
+are reasonable and promoting them would clutter the submitter UI.
+
+## Two axes of parallelism, and which one is bigger here
+
+Evaluation parallelises two ways, and they compose:
+
+- **Across machines** — `EvalShards` independent tasks, each scoring the same
+  checkpoint on its own seed and domain-randomization condition. Measured on
+  this sample: **4.95x cold, 5.42x warm** over 8 workers.
+- **Inside one process** — `EvalNumEnvs` Isaac Lab environments batched on one
+  GPU.
+
+Published Isaac Lab numbers make the in-process axis look dominant (NVIDIA
+reports 40x, at 4096 envs across 8 GPUs). That does not transfer to this
+workload, and the reason is structural: tiled rendering scales **total pixels
+linearly with `num_envs`**, and this task renders two 640x480 cameras with three
+annotators each, *per env*. Batching amortizes the fixed per-step cost; it
+cannot reduce pixels. Fitting the two measured points on this sample gives a
+per-step cost of roughly `38 ms + 14 ms per env`, i.e. an in-process ceiling
+near **3.7x**.
+
+**So for this observation spec, fan-out is the bigger axis and vectorization is
+roughly a 3x multiplier on top of it.** A lighter observation spec would shift
+the balance back.
+
+`EvalNumEnvs` is also a correctness knob, not only a speed knob. NVIDIA
+documents the renderer as stochastic with no determinism guarantee, and
+anti-aliasing switches mode on the *combined* tiled resolution, which is a
+function of the env count. For a vision policy the image *is* the observation,
+so success rates measured at different values are not guaranteed comparable.
+Every shard records the value it used and `Aggregate` reports a per-`num_envs`
+split rather than averaging across them.
+
+The MP4 is recorded from a single env (`EvalVideo` / `--video-env`) because a
+tiled grid of N shrunken views cannot show a 4 mm vial tip. The video is a
+sample; success is counted over every env and every episode.
 
 ## Why these design choices
 
@@ -293,7 +338,7 @@ without touching anything upstream.
   `manylinux_2_35` (glibc ≥ 2.35) and Amazon Linux 2023 ships glibc 2.34, so
   `pip install isaacsim` cannot run on the default service-managed fleet worker
   OS — and glibc is the system loader, so conda cannot substitute it at runtime.
-  The runtime is ~50 GB either way, so a conda package would win nothing on
+  The runtime is ~29 GB on disk either way, so a conda package would win nothing on
   size, and NVIDIA recommends Docker for headless and cloud use.
 - **All four GPU steps in the *same* container.** The image already carries LeRobot
   at the workshop's pinned commit with `lerobot-train` on `PATH`. Running Train
@@ -304,7 +349,7 @@ without touching anything upstream.
 - **Local inference, not the workshop's GR00T server.** The workshop's
   `lerobot_eval.py` is a ZMQ *client* of `run_gr00t_server.py`, which lives in a
   second container. On a worker that would mean a daemon-process job environment
-  plus another ~50 GB image pull. Meanwhile `LeRobotSO101Interface` already
+  plus another ~9 GB image pull. Meanwhile `LeRobotSO101Interface` already
   contains a complete local LeRobot inference path (`make_policy`,
   `sim_obs_to_policy_processor`, `prediction_to_sim_processor`) that no workshop
   script calls. Render and Evaluate use it, so one image covers all four GPU
@@ -403,192 +448,6 @@ without touching anything upstream.
   interpolated directly — the schema already guarantees they cannot contain shell
   metacharacters.
 
-## Prerequisites
-
-1. **A Deadline Cloud farm and queue with a Linux x86_64 GPU fleet** whose
-   workers have Docker and the NVIDIA Container Toolkit. Deadline Cloud
-   service-managed Linux GPU fleets have both. Raise the fleet's root volume to
-   at least **500 GiB** — the image is ~50 GB and the shader cache adds ~10 GB.
-2. **Build the container image and push it to a registry you control.**
-
-   ```bash
-   cd ../../containers/isaacsim-so101-workshop
-   docker build -t isaacsim-so101-workshop:2.3.2 .
-   ```
-
-   Then push to your own private Amazon ECR repository — see
-   [`containers/isaacsim-so101-workshop/README.md`](../../containers/isaacsim-so101-workshop/README.md)
-   for the exact commands and the fleet-role permissions.
-
-   > **This bundle does not, and cannot, ship a working default image.** The
-   > built image contains Omniverse Kit, which may not be redistributed, so
-   > there is no public URI to point at. The base image
-   > `nvcr.io/nvidia/isaac-lab:2.3.2` is anonymously pullable from NVIDIA — no
-   > NGC account or API key needed — so building it yourself is a one-command
-   > prerequisite, not a licensing negotiation. Keep the built image private.
-3. **The Deadline Cloud CLI** configured (`deadline config show` resolves your
-   default farm and queue).
-
-A [Conda queue environment](https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/conda-queue-environment.html)
-is *not* required. The container carries the whole Python runtime, so
-`CondaPackages` defaults to empty; the parameter exists only so this bundle
-still submits cleanly to a queue that has one attached.
-
-## Calibrate the scripted expert first
-
-The scripted expert reaches positions with a damped-least-squares servo whose
-Jacobian is measured by finite differences, so it needs **no link lengths and no
-analytic IK**. What it does need is a handful of geometric constants that can
-only be measured against the actual SO-ARM101 USD on a GPU.
-
-**Run the probe first.** It boots the environment, resets once, prints the joint
-names and limits, the home pose, the end-effector frame pose and quaternion,
-every body position, the vial / rack / slot poses, and a Jacobian self-test that
-commands a known 1 cm displacement and reports the measured one — then exits
-without recording:
-
-```bash
-OUT="$(pwd)/output"; mkdir -p "$OUT"
-deadline bundle submit isaacsim_so101_sim_to_policy \
-  -p "ContainerImage=<your-ecr-uri>" -p EcrLogin=true \
-  -p ProbeOnly=true -p "OutputDir=$OUT" --yes
-```
-
-Read `OutputDir/probe_summary.json` and `OutputDir/logs/datagen.log`, then set:
-
-| Parameter | How to read it off the probe |
-|-----------|------------------------------|
-| `GraspZOffset` | The z gap between the `gripper` body origin (which *is* the end-effector frame) and the pinch point between the jaws. |
-| `GripperPitchOffset` | The correction to the home gripper pitch that points the jaw at the mat. The expert holds `Pitch + Elbow + Wrist_Pitch` constant, which holds gripper pitch constant, so this one scalar is the whole grasp-orientation calibration. |
-| `ReorientOffset` | The gripper pitch change that stands a lying vial upright. The vials spawn horizontal but the success term requires `abs(vial up z) > 0.7`, so this rotation is what makes the task solvable at all. The sign depends on the gripper's frame convention. |
-| `JawOpen` / `JawClosed` | From the `Jaw` joint limits. |
-
-Uncalibrated, Datagen discards every attempt and **exits non-zero** rather than
-writing a bad dataset. That failure mode is deliberate: a miscalibrated expert
-produces a failed task, never a garbage dataset that Train would silently
-finetune on.
-
-Finer tuning (`--hover-height`, `--lift-height`, `--insert-clearance`,
-`--servo-tol`, `--servo-step-m`, `--servo-damping`, `--fd-delta`,
-`--jacobian-refresh`) is available on
-[`scripts/generate_dataset.py`](scripts/generate_dataset.py) but is not surfaced
-as job parameters; the defaults are reasonable and promoting them would clutter
-the submitter UI.
-
-## Submit
-
-```bash
-# Submit with an absolute, known output path (so outputs upload correctly):
-OUT="$(pwd)/output"; mkdir -p "$OUT"
-deadline bundle submit isaacsim_so101_sim_to_policy \
-  -p "ContainerImage=<account>.dkr.ecr.<region>.amazonaws.com/isaacsim-so101-workshop:2.3.2" \
-  -p EcrLogin=true \
-  -p "OutputDir=$OUT" \
-  -p EvalShards=8 -p EvalEpisodesPerShard=12 --yes
-```
-
-That submits `4 + 8 = 12` tasks, of which eight are Evaluate shards that all
-become schedulable at once. How many actually run concurrently is
-`min(EvalShards, workers the fleet has running)` — **match `EvalShards` to the
-worker count you expect** for the shortest wall clock. More shards than workers
-still works, they just queue.
-
-Or review parameters in a GUI before sending:
-
-```bash
-deadline bundle gui-submit isaacsim_so101_sim_to_policy
-```
-
-Watch progress and collect the videos and the aggregate number:
-
-```bash
-deadline job get --job-id <job-id>
-deadline job download-output --job-id <job-id>
-cat "$OUT/eval_summary.json"          # overall + per-shard + per-condition
-ls "$OUT/eval/"                       # shard_NN.json + shard_NN.mp4 grid
-```
-
-Or just read the `5 - Aggregate` task log, which contains the same table.
-
-### Recommended first real run: Train + Render on an existing dataset
-
-Datagen is the only step that depends on the calibration above. Train and Render
-do not. So the fastest way to prove the image, the fleet, the GPU wiring, and
-two thirds of the pipeline is to **skip Datagen** and run Train + Render against
-a LeRobot v3.0 dataset you already have — for example one of the workshop
-course's published SO-101 teleop datasets, or a dataset from the MuJoCo sample:
-
-```bash
-OUT="$(pwd)/output"; mkdir -p "$OUT/dataset"
-# place a LeRobot v3.0 dataset (meta/info.json + data/ + videos/) in $OUT/dataset
-deadline bundle submit isaacsim_so101_sim_to_policy \
-  -p "ContainerImage=<your-ecr-uri>" -p EcrLogin=true \
-  -p "DatasetRepoId=<the dataset's repo id>" \
-  -p "Instruction=<the instruction it was recorded with>" \
-  -p "OutputDir=$OUT" --yes
-```
-
-Then mark the Datagen step **`SUCCEEDED`** — do **not** cancel it:
-
-```bash
-aws deadline update-step --farm-id "$FARM" --queue-id "$QUEUE" --job-id "$JOB" \
-  --step-id "<datagen-step-id>" --target-task-run-status SUCCEEDED
-```
-
-> **Do not cancel Datagen.** Cancelling (or failing) a step transitively cancels
-> everything downstream of it, so `Train` and `Render` would be `CANCELED` too and
-> the whole job would end up doing nothing. Per the Deadline Cloud docs: "If StepA
-> fails, or if StepA is canceled, StepB moves to the CANCELED state." `SUCCEEDED`
-> is the only status that *resolves* a dependency edge and lets `Train` start.
-
-`Instruction` and `DatasetRepoId` must match the dataset, because ACT is
-conditioned on the instruction and `lerobot-train` resolves the dataset by repo
-id.
-
-Also note `OutputDir` is declared `dataFlow: INOUT`, so it is uploaded as an
-**input** as well as collected as an output. For a Train- or Render-only run,
-whatever the earlier step produced has to exist in your local `OutputDir` before
-you submit — run `deadline job download-output --job-id <previous-job>` first, or
-the step will fail its own "no dataset" / "no checkpoint" guard.
-
-## Parameters
-
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `Instruction` | `pick up the vial and place it in the rack` | Recorded on every frame, conditions training, and passed to the policy at render and evaluation time. One parameter for every step that uses it (Datagen, Render, Evaluate) so they cannot drift. |
-| `Episodes` | `50` | Target count of **verified** episodes. |
-| `MaxAttemptFactor` | `6` | Datagen gives up after `Episodes × this`. |
-| `Randomize` | `true` | Selects the `-DR-Eval` task for Datagen (robot colour, HDRI sky light, mat rotation, camera focal length, camera pose). Render always uses the non-randomized variant. |
-| `Fps` | `30` | Dataset and video frame rate. |
-| `EpisodeLengthSeconds` | `15.0` | Overrides the env cfg. The workshop's `-Eval` variants ship 7.5 s, too short for reach + grasp + reorient + insert + the 25-frame confirmation. |
-| `Seed` | `101` | Environment seed. |
-| `DatasetRepoId` | `local/so101_isaac_vials` | LeRobot repo id in the dataset metadata. |
-| `ProbeOnly` | `false` | Run Datagen in calibration-probe mode and record nothing. |
-| `GraspZOffset` | `0.0` | **Needs calibration.** See above. |
-| `GripperPitchOffset` | `0.0` | **Needs calibration.** |
-| `ReorientOffset` | `1.5708` | **Needs calibration** (sign especially). |
-| `JawOpen` / `JawClosed` | `0.6` / `-0.1` | **Needs calibration.** |
-| `TrainSteps` | `20000` | ACT finetuning steps. |
-| `TrainBatchSize` | `8` | Training batch size. |
-| `ActNActionSteps` | `20` | ACT actions executed open-loop per observation. Below `chunk_size` (100) to run closed-loop. |
-| `RenderEpisodes` | `3` | Policy rollouts, all in one MP4. |
-| `RenderCamera` | `external_D455` | `external_D455` is the third-person lightbox view; `ego` is the wrist camera. Also used by Evaluate. |
-| `EvalShards` | `8` | **Number of Evaluate tasks created.** Total job tasks = `4 + EvalShards`, deterministically. Observed *concurrency* is a separate matter — capped by `min(EvalShards, running workers)` and by whether the tasks last long enough for autoscaling to react. More shards than workers still works, they just queue. |
-| `EvalEpisodesPerShard` | `12` | Episodes per shard. **Keep it chunky** — see "Sizing the shards" below. Total episodes = `EvalShards × EvalEpisodesPerShard`. Keep it a multiple of `EvalNumEnvs`. |
-| `EvalNumEnvs` | `12` | **Environments each shard simulates in parallel, in one process, on one GPU** — the *other* parallelism axis, and on published numbers the bigger one. Episodes run in `ceil(EvalEpisodesPerShard / EvalNumEnvs)` batches, the scheme LeRobot's own `lerobot_eval.py` uses. **Pin it and report it** — see "Two axes of parallelism" below. |
-| `EvalDeterministicScene` | `false` | Pin *every* reset-event range (object poses, light exposure, mat yaw, focal length, camera pose, sky light) so every env in every episode starts from an identical scene. The control for an `EvalNumEnvs` A/B; not for a real measurement, because every episode becomes the same episode. |
-| `EvalBaseSeed` | `20001` | Seed of shard 1; shard *i* gets `EvalBaseSeed + (i-1) × 1000`. Deliberately distinct from `Seed`: evaluating on the seeds the data was generated from measures memorisation, not generalisation. |
-| `EvalRandomize` | `alternate` | `alternate` = odd shards nominal, even shards randomized, so one submit yields both numbers and the gap between them. `on` / `off` put every shard in one condition. Prefer an **even** `EvalShards` so the two conditions get equal episode counts. |
-| `EvalVideo` | `true` | Write `eval/shard_NN.mp4` per shard. `false` skips the encode *and* the per-step GPU→CPU frame copy that feeds it — the cheapest way to speed up a wide fan-out when only the success rate matters. |
-| `ContainerImage` | `isaacsim-so101-workshop:2.3.2` | **No working default is possible** — see Prerequisites. |
-| `EcrLogin` | `false` | `docker login` to Amazon ECR before pulling. The region is parsed from the image URI. |
-| `ShaderCacheDir` | `/mnt/deadline-persistent/isaacsim-so101-cache` | Host path for the Omniverse / pip / torch-hub caches, reused across tasks on the same worker. Defaults to a **fleet persistent volume** so it survives worker replacement; falls back to `/tmp` with a warning if the path is not writable, so it is safe on fleets without one. |
-| `StepTimeoutSeconds` | `5400` | In-container wall-clock budget, **shared by all steps**. Keep below the queue's task timeout so the container exits cleanly and outputs still upload. Raise it if you raise `EvalEpisodesPerShard` — see below. |
-| `CondaPackages` | `''` | Intentionally empty; the container carries the runtime. |
-| `CondaChannels` | `deadline-cloud` | Only read by a Conda queue environment, if one is attached. |
-| `OutputDir` | `output` | Shared work dir. Pass an **absolute** path on submit. |
-| `JobScriptDir` | `scripts` | Hidden. Holds the two Python entrypoints and `run_in_container.sh`, staged as a job-attachment input. |
-
 ## Sizing the shards, and what the first fan-out costs
 
 ### Shards must be chunky. Do not set `EvalEpisodesPerShard=1`.
@@ -665,23 +524,7 @@ with `maxWorkerCount=8`, each starting from a scaled-down fleet. Run 2 followed 
 | Scale-up stagger (shard 1→8 start) | 585 s (~9.8 min) | **344 s (~5.7 min)** |
 | Spot reclamations / retries | 0 | 0 |
 
-Run 1's per-shard detail, showing the staggered ramp that costs the speedup:
-
-```
-shard  start     end       secs   boot   worker (suffix)
------  --------  --------  ----   ----   ---------------
-1      14:02:20  14:19:42  1042   284s   ...5bfafd7a
-2      14:06:35  14:22:07   932   201s   ...d779b08a
-3      14:08:27  14:24:08   941   202s   ...65efa0c15
-4      14:10:25  14:24:48   863   203s   ...85b4abb4
-5      14:10:56  14:25:12   857   200s   ...a18708db
-6      14:11:42  14:26:48   906   213s   ...4f4739978
-7      14:11:56  14:26:35   879   201s   ...91668321c
-8      14:12:05  14:26:59   893   213s   ...6fbabb71d
-```
-
-**Why 5.42× and not 8×, even warm.** Look at the start column: the shards do not
-start together. The fleet scales up one instance at a time, so shard 8 begins ~5.7
+**Why 5.42× and not 8×, even warm.** The shards do not start together. The fleet scales up one instance at a time, so shard 8 begins ~5.7
 minutes (warm) or ~9.8 minutes (cold) after shard 1. That ramp — not the rollout —
 is the entire gap to the theoretical 8×. On a fleet whose 8 workers are *already
 running*, the same job should land close to 8×.
@@ -702,7 +545,6 @@ demonstration that `ShaderCacheDir` is doing what it claims.
 - **One shard in run 2 was an outlier: 193 s boot against ~30 s for the other
   seven**, despite reporting `WARM` and running on an identical GPU and driver
   (`NVIDIA L4`, `580.159.03` — checked, because a GPU-architecture mismatch would
-  have been a plausible cause and turned out not to be it). Cause not determined.
   Expect this kind of per-instance variance and prefer medians over single-shard
   timings.
 
@@ -712,7 +554,7 @@ action, and **dedupe to one interval per shard** before computing overlap or a
 Spot-retried shard will read as phantom concurrency.
 
 A measured example. A `ProbeOnly=true` run of this exact template
-(`job-aac7a87bf6754c8285e46f9e995dcef1`, 3 shards) succeeded on all 7 tasks, and
+(3 shards) succeeded on all 7 tasks, and
 the fan-out produced exactly the expected `4 + 3 = 7` tasks — but every task ran
 on **one** worker, strictly sequentially:
 
@@ -782,7 +624,6 @@ Measured, on the two runs above:
 > - Raising `maxWorkerCount` beyond your last run's width re-introduces cold
 >   workers at the margin: the new instances have no volume to inherit.
 >
-> (An earlier draft of this README claimed "at most one worker inherits an
 > already-warm volume". Run 2 disproved it; the rule above replaces it.)
 
 **Consequence: measure the speedup on the second run, not the first.** Run 1 of a
@@ -868,7 +709,6 @@ The useful subsets:
 - **Probe only** — `-p ProbeOnly=true`. Datagen prints calibration data and
   records nothing, and Train, Render, **every Evaluate shard** and Aggregate then
   skip themselves with success. The job comes back green and no step surgery is
-  needed. (Earlier revisions let the downstream steps fail on their missing-input
   guards, which marked the whole job FAILED, retried an unclearable error
   `maxRetriesPerTask` times, and made a working probe look broken. This matters
   most for Evaluate: without the guard a probe run becomes `EvalShards` failed
@@ -969,7 +809,6 @@ inside the container, so you do not pass `--checkpoint` yourself.
 unchanged. Three things had to be true at once, and each one alone silently
 produces a headless run:
 
-1. **`--gui` exists at all.** `ARGS.headless` used to be an unconditional `True`.
 2. **`HEADLESS=0` in the environment.** The workshop image sets `HEADLESS=1` in
    its own `ENV`, and Isaac Lab's `AppLauncher._resolve_headless_settings()` only
    lets the flag *raise* headless: with `headless=False` it falls through to
@@ -1118,7 +957,6 @@ red proves nothing. It also pins the invariants that matter:
 - `--num-envs 1` still works for a policy with no `_action_queue` at all, so the
   `3 - Render` step is not newly restricted to ACT.
 
-Exit codes added by this work: **6** = the checkpoint's policy cannot be driven at
 `num_envs > 1` (temporal ensembling, or no swappable action queue), and **2** now
 also covers `--deterministic-scene` finding no reset ranges to pin — a silently
 ineffective determinism flag is worse than no flag, so it is a hard stop.

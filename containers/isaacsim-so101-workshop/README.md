@@ -30,7 +30,7 @@ cd containers/isaacsim-so101-workshop
 docker build -t isaacsim-so101-workshop:2.3.2 .
 ```
 
-The build pulls a ~20 GB base image and finishes at roughly 50 GB. Budget disk
+The finished image is ~9 GB to pull and unpacks to ~29 GB. Budget disk
 accordingly — a small EBS root volume is the most common reason this fails.
 
 Override the pins if you need to:

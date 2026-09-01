@@ -92,7 +92,8 @@ if [ "$ECR_LOGIN" = "true" ]; then
 fi
 
 echo "[bundle] docker pull $IMAGE"
-# ~50 GB image: 5-10 min on a worker that has never pulled it, seconds after.
+# ~9 GB to pull (~29 GB unpacked): 4-10 min on a worker that has never pulled
+# it, seconds after.
 time docker pull "$IMAGE"
 
 # --- Caches -----------------------------------------------------------------
